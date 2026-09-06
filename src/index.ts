@@ -25,6 +25,7 @@ import { ExecutionEngine } from "./execution";
 import { BotLogger } from "./logger";
 import { buildStrategyRegistry } from "./strategies";
 import { startHealthServer } from "./healthCheck";
+import { TelegramNotifier } from "./notifications";
 import { v4 as uuidv4 } from "uuid";
 
 // ============================================================
@@ -184,6 +185,7 @@ class TradingBot {
   private classifier: FlowClassifier;
   private engine: ExecutionEngine;
   private logger: BotLogger;
+  private telegram: TelegramNotifier;
 
   private lastProcessedCandleTs: number = 0;
   private sessionStartTs: number = 0;
@@ -194,16 +196,46 @@ class TradingBot {
     exchange: Exchange,
     classifier: FlowClassifier,
     engine: ExecutionEngine,
-    logger: BotLogger
+    logger: BotLogger,
+    telegram: TelegramNotifier
   ) {
     this.config = config;
     this.exchange = exchange;
     this.classifier = classifier;
     this.engine = engine;
     this.logger = logger;
+    this.telegram = telegram;
 
-    // Wire trade events to logger
-    this.engine.onTradeUpdate = (trade) => this.logger.logTrade(trade);
+    // Wire trade events to logger + telegram
+    this.engine.onTradeUpdate = (trade) => {
+      this.logger.logTrade(trade);
+
+      if (trade.outcome === "OPEN") {
+        const score = trade.indicators ? 0 : 0;
+        this.telegram.notifyTradeOpen({
+          id: trade.id,
+          strategy: trade.strategyId,
+          direction: trade.direction,
+          symbol: trade.symbol,
+          entry: trade.entryPrice,
+          stopLoss: trade.stopLoss,
+          takeProfit: trade.takeProfit,
+          size: trade.size,
+          flow: trade.flow.flow,
+          score,
+        });
+      } else {
+        this.telegram.notifyTradeClose({
+          id: trade.id,
+          outcome: trade.outcome,
+          pnlRaw: trade.pnlRaw ?? 0,
+          pnlR: trade.pnlR ?? 0,
+          exitPrice: trade.exitPrice ?? 0,
+          strategy: trade.strategyId,
+          durationMin: Math.round((trade.durationMs ?? 0) / 60000),
+        });
+      }
+    };
   }
 
   async start(): Promise<void> {
@@ -213,6 +245,11 @@ class TradingBot {
       paperTrading: this.config.paperTrading,
       session: `${this.config.sessionStartUTC}:00–${this.config.sessionEndUTC}:00 UTC`,
     });
+
+    this.telegram.notifyBotStarted(
+      this.config.symbol,
+      `${this.config.sessionStartUTC}:00–${this.config.sessionEndUTC}:00 UTC`
+    );
 
     // Register graceful shutdown
     process.on("SIGINT", () => this.shutdown("SIGINT"));
@@ -252,6 +289,25 @@ class TradingBot {
         this.sessionStartTs,
         Date.now()
       );
+
+      const closed = this.engine.getClosedTrades();
+      const wins = closed.filter((t) => t.outcome === "WIN").length;
+      const losses = closed.filter((t) => t.outcome === "LOSS").length;
+      const totalR = closed.reduce((s, t) => s + (t.pnlR ?? 0), 0);
+      const totalPnl = closed.reduce((s, t) => s + (t.pnlRaw ?? 0), 0);
+      const winRate = wins + losses > 0
+        ? ((wins / (wins + losses)) * 100).toFixed(1)
+        : "0";
+
+      this.telegram.notifySessionSummary({
+        date: new Date().toLocaleDateString("en-NG", { timeZone: "Africa/Lagos" }),
+        totalTrades: closed.length,
+        wins,
+        losses,
+        totalR: parseFloat(totalR.toFixed(2)),
+        totalPnl: parseFloat(totalPnl.toFixed(4)),
+        winRate,
+      });
 
       this.sessionStartTs = 0; // reset for next session
       return;
@@ -436,8 +492,9 @@ async function main(): Promise<void> {
   const strategies = buildStrategyRegistry();
   const classifier = new FlowClassifier(strategies);
   const engine = new ExecutionEngine(exchange, config);
+  const telegram = new TelegramNotifier();
 
-  const bot = new TradingBot(config, exchange, classifier, engine, logger);
+  const bot = new TradingBot(config, exchange, classifier, engine, logger, telegram);
   await bot.start();
 }
 
