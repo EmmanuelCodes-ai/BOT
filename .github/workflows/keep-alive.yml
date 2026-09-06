@@ -1,0 +1,22 @@
+name: Keep Render Alive
+
+on:
+  schedule:
+    # Runs every 10 minutes — prevents Render free tier from sleeping
+    - cron: "*/10 * * * *"
+  workflow_dispatch: # allow manual trigger from GitHub UI
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          echo "Pinging Render health endpoint..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 ${{ secrets.RENDER_URL }}/health)
+          echo "Response status: $STATUS"
+          if [ "$STATUS" = "200" ]; then
+            echo "✓ Bot is alive"
+          else
+            echo "⚠ Unexpected status $STATUS — bot may be starting up"
+          fi

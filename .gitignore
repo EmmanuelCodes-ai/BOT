@@ -1,0 +1,23 @@
+# Environment — never commit real credentials
+.env
+
+# Build output
+dist/
+
+# Dependencies
+node_modules/
+
+# Logs — may contain sensitive trade data
+logs/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TypeScript cache
+*.tsbuildinfo

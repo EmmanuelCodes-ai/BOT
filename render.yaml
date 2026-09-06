@@ -1,0 +1,45 @@
+services:
+  - type: worker
+    name: trading-bot
+    runtime: node
+    region: singapore
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node dist/index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: EXCHANGE_ID
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: API_SECRET
+        sync: false
+      - key: SYMBOL
+        sync: false
+      - key: MARKET_TYPE
+        sync: false
+      - key: PAPER_TRADING
+        sync: false
+      - key: BYBIT_DEMO_MODE
+        sync: false
+      - key: SANDBOX_MODE
+        sync: false
+      - key: RISK_PER_TRADE_PCT
+        sync: false
+      - key: RISK_REWARD_RATIO
+        sync: false
+      - key: ATR_MULTIPLIER_SL
+        sync: false
+      - key: MAX_OPEN_TRADES
+        sync: false
+      - key: MIN_VOLUME_MULTIPLIER
+        sync: false
+      - key: SESSION_START_UTC
+        sync: false
+      - key: SESSION_END_UTC
+        sync: false
+      - key: TIMEFRAME
+        sync: false
+      - key: LOG_LEVEL
+        sync: false
