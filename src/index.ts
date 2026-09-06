@@ -74,10 +74,6 @@ function buildExchange(config: BotConfig): Exchange {
     throw new Error(`Unknown CCXT exchange: ${exchangeId}`);
   }
 
-  // Bybit Demo Trading uses a dedicated stable endpoint on mainnet infrastructure.
-  // It is strongly preferred over the unreliable testnet.
-  // Enable by setting BYBIT_DEMO_MODE=true and using demo API keys from
-  // bybit.com → switch to Demo Trading → API Management.
   const isDemoMode =
     process.env.BYBIT_DEMO_MODE === "true" &&
     process.env.EXCHANGE_ID === "bybit";
@@ -85,21 +81,26 @@ function buildExchange(config: BotConfig): Exchange {
   const exchange: Exchange = new ExchangeClass({
     apiKey: process.env.API_KEY,
     secret: process.env.API_SECRET,
+    // Override all URLs to use api-demo.bybit.com when in demo mode.
+    // This bypasses geo-blocks on the standard api.bybit.com endpoint.
+    ...(isDemoMode && {
+      urls: {
+        api: {
+          public: "https://api-demo.bybit.com",
+          private: "https://api-demo.bybit.com",
+        },
+      },
+    }),
     options: {
       defaultType: process.env.MARKET_TYPE ?? "future",
-      fetchCurrencies: false,   // skip coin/query-info — slow and not needed
+      fetchCurrencies: false,
       ...(isDemoMode && { demo: true }),
     },
   });
 
   // Force-disable fetchCurrencies at the instance level.
-  // CCXT's bybit ignores the options flag and always calls coin/query-info
-  // during loadMarkets — overriding the method is the only reliable fix.
   (exchange as any).fetchCurrencies = async () => ({});
 
-  // SANDBOX_MODE controls whether to hit the exchange testnet endpoint.
-  // Only enable if you specifically have testnet credentials.
-  // Prefer BYBIT_DEMO_MODE=true over SANDBOX_MODE=true for Bybit.
   const sandboxMode = process.env.SANDBOX_MODE === "true";
   if (sandboxMode) {
     exchange.setSandboxMode(true);

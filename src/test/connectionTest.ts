@@ -37,6 +37,14 @@ async function run(): Promise<void> {
   const exchange = new ExchangeClass({
     apiKey: process.env.API_KEY,
     secret: process.env.API_SECRET,
+    ...(isDemoMode && {
+      urls: {
+        api: {
+          public: "https://api-demo.bybit.com",
+          private: "https://api-demo.bybit.com",
+        },
+      },
+    }),
     options: {
       defaultType: MARKET_TYPE,
       fetchCurrencies: false,
@@ -45,9 +53,6 @@ async function run(): Promise<void> {
   });
 
   // Force-disable fetchCurrencies at the instance level.
-  // CCXT's bybit implementation ignores the options flag and always calls
-  // coin/query-info during loadMarkets — overriding the method is the
-  // only reliable way to skip it.
   (exchange as any).fetchCurrencies = async () => ({});
 
   console.log(`     Exchange : ${exchangeId}`);
