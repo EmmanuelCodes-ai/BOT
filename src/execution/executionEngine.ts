@@ -5,13 +5,15 @@
 //   1. Candle-close validation — only acts on fully closed M5 bars
 //   2. Per-candle execution lock — prevents duplicate orders in the
 //      same 5-minute block
-//   3. Position sizing — risk-pct of account balance / ATR-based stop
-//   4. Order placement — paper (simulated) or live via CCXT
-//   5. Open trade tracking — monitors SL/TP and marks outcomes
-//   6. maxOpenTrades guard
+//   3. Order sanity validation — strict directional checks before sizing
+//   4. Position sizing — risk-pct of account balance / ATR-based stop
+//   5. CCXT precision normalization — tick/lot size compliance
+//   6. Order placement — paper (simulated) or live via CCXT
+//   7. Open trade tracking — monitors SL/TP and marks outcomes
+//   8. maxOpenTrades guard
 // ============================================================
 
-import ccxt, { Exchange } from "ccxt";
+import { Exchange } from "ccxt";
 import { v4 as uuidv4 } from "uuid";
 import {
   Signal,
@@ -23,28 +25,33 @@ import {
   BotConfig,
   Candle,
 } from "../types";
+import { BotLogger } from "../logger";
 
 // ── Internal state ─────────────────────────────────────────
 interface ExecutionState {
-  /** Candle timestamp of the last block where an order was attempted */
   lastOrderCandleTs: number;
-  /** All currently open trades */
   openTrades: Map<string, Trade>;
-  /** All closed trades this session */
   closedTrades: Trade[];
+}
+
+// ── Sanity check result ─────────────────────────────────────
+interface SanityCheckResult {
+  valid: boolean;
+  reason: string;
 }
 
 export class ExecutionEngine {
   private exchange: Exchange;
   private config: BotConfig;
   private state: ExecutionState;
+  private logger: BotLogger;
 
-  /** Callback fired whenever a trade is opened or closed — used by the logger */
   public onTradeUpdate: ((trade: Trade) => void) | null = null;
 
-  constructor(exchange: Exchange, config: BotConfig) {
+  constructor(exchange: Exchange, config: BotConfig, logger: BotLogger) {
     this.exchange = exchange;
     this.config = config;
+    this.logger = logger;
     this.state = {
       lastOrderCandleTs: 0,
       openTrades: new Map(),
@@ -56,68 +63,78 @@ export class ExecutionEngine {
   // Public: attempt to execute a signal
   // ──────────────────────────────────────────────────────────
 
-  /**
-   * Entry point called by the main loop after the classifier fires a signal.
-   *
-   * @param signal      - The signal from the flow classifier
-   * @param triggerTs   - Timestamp of the M5 candle that triggered the signal
-   * @returns The created Trade object, or null if blocked
-   */
   async execute(signal: Signal, triggerTs: number): Promise<Trade | null> {
-    // ── 1. Execution lock — one order per 5-minute block ──
+    // ── 1. Execution lock ──────────────────────────────────
     if (triggerTs <= this.state.lastOrderCandleTs) {
-      console.warn(
-        `[Engine] Execution blocked — already acted on candle block ${new Date(triggerTs).toISOString()}`
-      );
+      this.logger.warn("[Engine] Execution blocked — already acted on candle block", {
+        candleTs: new Date(triggerTs).toISOString(),
+      });
       return null;
     }
 
     // ── 2. Max open trades guard ───────────────────────────
     if (this.state.openTrades.size >= this.config.maxOpenTrades) {
-      console.warn(
-        `[Engine] Max open trades (${this.config.maxOpenTrades}) reached — skipping signal`
-      );
+      this.logger.warn("[Engine] Max open trades reached — skipping signal", {
+        max: this.config.maxOpenTrades,
+        current: this.state.openTrades.size,
+      });
       return null;
     }
 
-    // ── 3. Fetch current balance ───────────────────────────
+    // ── 3. Order sanity validation ─────────────────────────
+    const sanity = this.validateSignal(signal);
+    if (!sanity.valid) {
+      this.logger.error("[Engine] Signal failed sanity check — aborting", {
+        reason: sanity.reason,
+        direction: signal.direction,
+        entry: signal.entryPrice,
+        sl: signal.stopLoss,
+        tp: signal.takeProfit,
+      });
+      return null;
+    }
+
+    // ── 4. Fetch current balance ───────────────────────────
     const balance = await this.fetchBalance();
     if (balance <= 0) {
-      console.error("[Engine] Unable to fetch valid balance");
+      this.logger.error("[Engine] Unable to fetch valid balance");
       return null;
     }
 
-    // ── 4. Position sizing ────────────────────────────────
-    // Risk amount = balance × riskPerTradePct
-    // Stop distance = |entry - stopLoss|
-    // Size = riskAmount / stopDistance  (in base currency units)
-    const riskAmount = balance * this.config.riskPerTradePct;
+    // ── 5. Position sizing ─────────────────────────────────
     const stopDistance = Math.abs(signal.entryPrice - signal.stopLoss);
-
-    if (stopDistance === 0) {
-      console.error("[Engine] Stop distance is zero — cannot size position");
-      return null;
-    }
-
+    const riskAmount = balance * this.config.riskPerTradePct;
     const rawSize = riskAmount / stopDistance;
-    const size = parseFloat(rawSize.toFixed(8)); // normalize precision
 
-    if (size <= 0) {
-      console.error(`[Engine] Calculated size ${size} is invalid`);
+    if (rawSize <= 0 || !isFinite(rawSize)) {
+      this.logger.error("[Engine] Calculated size is invalid", {
+        rawSize,
+        riskAmount,
+        stopDistance,
+      });
       return null;
     }
 
-    // ── 5. Place order (paper or live) ────────────────────
+    // ── 6. CCXT precision normalization ────────────────────
+    const { entry, sl, tp, size } = this.normalizePrecision(
+      signal.symbol,
+      signal.entryPrice,
+      signal.stopLoss,
+      signal.takeProfit,
+      rawSize
+    );
+
+    // ── 7. Place order (paper or live) ────────────────────
     const order = this.config.paperTrading
-      ? this.paperOrder(signal, size)
-      : await this.liveOrder(signal, size);
+      ? this.paperOrder(signal, entry, sl, tp, size)
+      : await this.liveOrder(signal, entry, sl, tp, size);
 
     if (!order) return null;
 
-    // ── 6. Lock this candle block ──────────────────────────
+    // ── 8. Lock this candle block ──────────────────────────
     this.state.lastOrderCandleTs = triggerTs;
 
-    // ── 7. Build Trade record ─────────────────────────────
+    // ── 9. Build Trade record ─────────────────────────────
     const trade: Trade = {
       id: uuidv4(),
       signalId: signal.id,
@@ -126,10 +143,10 @@ export class ExecutionEngine {
       strategyId: signal.strategyId,
       flow: signal.flow,
       direction: signal.direction,
-      entryPrice: signal.entryPrice,
+      entryPrice: entry,
       exitPrice: null,
-      stopLoss: signal.stopLoss,
-      takeProfit: signal.takeProfit,
+      stopLoss: sl,
+      takeProfit: tp,
       size,
       pnlRaw: null,
       pnlR: null,
@@ -146,21 +163,26 @@ export class ExecutionEngine {
     this.state.openTrades.set(trade.id, trade);
     this.onTradeUpdate?.(trade);
 
-    console.log(
-      `[Engine] Trade OPENED | ${trade.id.slice(0, 8)} | ${trade.direction} ${trade.symbol} @ ${trade.entryPrice} | SL=${trade.stopLoss} | TP=${trade.takeProfit} | Size=${trade.size}`
-    );
+    this.logger.info("[Engine] Trade OPENED", {
+      id: trade.id.slice(0, 8),
+      direction: trade.direction,
+      symbol: trade.symbol,
+      entry,
+      sl,
+      tp,
+      size,
+    });
 
     return trade;
   }
 
   // ──────────────────────────────────────────────────────────
-  // Public: check open trades against latest price
-  // Called every candle close from the main loop
+  // Public: check open trades against latest candle
   // ──────────────────────────────────────────────────────────
 
   checkOpenTrades(latestCandle: Candle): void {
-    for (const [id, trade] of this.state.openTrades) {
-      const { high, low, close } = latestCandle;
+    for (const [, trade] of this.state.openTrades) {
+      const { high, low } = latestCandle;
 
       let outcome: TradeOutcome | null = null;
       let exitPrice: number | null = null;
@@ -228,7 +250,94 @@ export class ExecutionEngine {
   }
 
   // ──────────────────────────────────────────────────────────
-  // Private helpers
+  // Private: order sanity validation
+  // ──────────────────────────────────────────────────────────
+
+  private validateSignal(signal: Signal): SanityCheckResult {
+    const { direction, entryPrice, stopLoss, takeProfit } = signal;
+    const stopDistance = Math.abs(entryPrice - stopLoss);
+
+    if (stopDistance === 0) {
+      return { valid: false, reason: "Stop distance is zero" };
+    }
+
+    if (direction === SignalDirection.LONG) {
+      if (stopLoss >= entryPrice) {
+        return {
+          valid: false,
+          reason: `LONG signal invalid: stopLoss (${stopLoss}) must be < entryPrice (${entryPrice})`,
+        };
+      }
+      if (takeProfit <= entryPrice) {
+        return {
+          valid: false,
+          reason: `LONG signal invalid: takeProfit (${takeProfit}) must be > entryPrice (${entryPrice})`,
+        };
+      }
+    } else {
+      if (stopLoss <= entryPrice) {
+        return {
+          valid: false,
+          reason: `SHORT signal invalid: stopLoss (${stopLoss}) must be > entryPrice (${entryPrice})`,
+        };
+      }
+      if (takeProfit >= entryPrice) {
+        return {
+          valid: false,
+          reason: `SHORT signal invalid: takeProfit (${takeProfit}) must be < entryPrice (${entryPrice})`,
+        };
+      }
+    }
+
+    return { valid: true, reason: "OK" };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Private: CCXT precision normalization
+  // ──────────────────────────────────────────────────────────
+
+  /**
+   * Normalizes all price and size values to the exchange's
+   * tick size and lot size requirements using CCXT built-ins.
+   * Falls back to raw values if the market is not found.
+   */
+  private normalizePrecision(
+    symbol: string,
+    entryPrice: number,
+    stopLoss: number,
+    takeProfit: number,
+    size: number
+  ): { entry: number; sl: number; tp: number; size: number } {
+    try {
+      const market = this.exchange.markets?.[symbol];
+      if (!market) {
+        this.logger.warn("[Engine] Market not found for precision normalization — using raw values", {
+          symbol,
+        });
+        return { entry: entryPrice, sl: stopLoss, tp: takeProfit, size };
+      }
+
+      const entry = parseFloat(this.exchange.priceToPrecision(symbol, entryPrice));
+      const sl = parseFloat(this.exchange.priceToPrecision(symbol, stopLoss));
+      const tp = parseFloat(this.exchange.priceToPrecision(symbol, takeProfit));
+      const normalizedSize = parseFloat(this.exchange.amountToPrecision(symbol, size));
+
+      this.logger.debug("[Engine] Precision normalization applied", {
+        raw: { entryPrice, stopLoss, takeProfit, size },
+        normalized: { entry, sl, tp, size: normalizedSize },
+      });
+
+      return { entry, sl, tp, size: normalizedSize };
+    } catch (err) {
+      this.logger.warn("[Engine] Precision normalization failed — using raw values", {
+        error: String(err),
+      });
+      return { entry: entryPrice, sl: stopLoss, tp: takeProfit, size };
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Private: trade closing
   // ──────────────────────────────────────────────────────────
 
   private closeTrade(
@@ -261,13 +370,25 @@ export class ExecutionEngine {
     this.state.closedTrades.push(closed);
     this.onTradeUpdate?.(closed);
 
-    console.log(
-      `[Engine] Trade CLOSED | ${closed.id.slice(0, 8)} | ${outcome} | PnL=${pnlRaw.toFixed(4)} (${pnlR.toFixed(2)}R) | Exit @ ${exitPrice}`
-    );
+    this.logger.info("[Engine] Trade CLOSED", {
+      id: closed.id.slice(0, 8),
+      outcome,
+      pnl: `${pnlRaw.toFixed(4)} (${pnlR.toFixed(2)}R)`,
+      exit: exitPrice,
+    });
   }
 
-  /** Simulate an immediate fill at signal entry price (paper trading) */
-  private paperOrder(signal: Signal, size: number): Order {
+  // ──────────────────────────────────────────────────────────
+  // Private: order methods
+  // ──────────────────────────────────────────────────────────
+
+  private paperOrder(
+    signal: Signal,
+    entry: number,
+    sl: number,
+    tp: number,
+    size: number
+  ): Order {
     const now = Date.now();
     return {
       id: uuidv4(),
@@ -275,9 +396,9 @@ export class ExecutionEngine {
       symbol: signal.symbol,
       direction: signal.direction,
       size,
-      entryPrice: signal.entryPrice,
-      stopLoss: signal.stopLoss,
-      takeProfit: signal.takeProfit,
+      entryPrice: entry,
+      stopLoss: sl,
+      takeProfit: tp,
       status: OrderStatus.FILLED,
       placedAt: now,
       filledAt: now,
@@ -285,9 +406,15 @@ export class ExecutionEngine {
     };
   }
 
-  /** Place a real market order + SL/TP orders via CCXT */
-  private async liveOrder(signal: Signal, size: number): Promise<Order | null> {
+  private async liveOrder(
+    signal: Signal,
+    entry: number,
+    sl: number,
+    tp: number,
+    size: number
+  ): Promise<Order | null> {
     const side = signal.direction === SignalDirection.LONG ? "buy" : "sell";
+    const slSide = side === "buy" ? "sell" : "buy";
     const now = Date.now();
 
     const order: Order = {
@@ -296,9 +423,9 @@ export class ExecutionEngine {
       symbol: signal.symbol,
       direction: signal.direction,
       size,
-      entryPrice: signal.entryPrice,
-      stopLoss: signal.stopLoss,
-      takeProfit: signal.takeProfit,
+      entryPrice: entry,
+      stopLoss: sl,
+      takeProfit: tp,
       status: OrderStatus.PENDING,
       placedAt: now,
       filledAt: null,
@@ -318,14 +445,13 @@ export class ExecutionEngine {
       order.filledAt = Date.now();
 
       // ── Stop-loss order ───────────────────────────────
-      const slSide = side === "buy" ? "sell" : "buy";
       await this.exchange.createOrder(
         signal.symbol,
         "stop_market" as any,
         slSide,
         size,
-        signal.stopLoss,
-        { stopPrice: signal.stopLoss, reduceOnly: true }
+        sl,
+        { stopPrice: sl, reduceOnly: true }
       );
 
       // ── Take-profit order ─────────────────────────────
@@ -334,16 +460,19 @@ export class ExecutionEngine {
         "take_profit_market" as any,
         slSide,
         size,
-        signal.takeProfit,
-        { stopPrice: signal.takeProfit, reduceOnly: true }
+        tp,
+        { stopPrice: tp, reduceOnly: true }
       );
 
       order.status = OrderStatus.FILLED;
-      console.log(
-        `[Engine] Live orders placed | Entry=${entryResp.id} | SL=${signal.stopLoss} | TP=${signal.takeProfit}`
-      );
+
+      this.logger.info("[Engine] Live orders placed", {
+        entryOrderId: entryResp.id,
+        sl,
+        tp,
+      });
     } catch (err) {
-      console.error("[Engine] Order placement failed:", err);
+      this.logger.error("[Engine] Order placement failed", { error: String(err) });
       order.status = OrderStatus.REJECTED;
       return null;
     }
@@ -351,11 +480,13 @@ export class ExecutionEngine {
     return order;
   }
 
-  /** Fetch available balance in quote currency */
+  // ──────────────────────────────────────────────────────────
+  // Private: balance fetching
+  // ──────────────────────────────────────────────────────────
+
   private async fetchBalance(): Promise<number> {
     if (this.config.paperTrading) {
-      // Return a fixed paper balance for sizing calculations
-      return 10_000;
+      return this.config.paperBalance;
     }
 
     try {
@@ -364,7 +495,7 @@ export class ExecutionEngine {
       const free = balances?.free as unknown as Record<string, number | undefined> | undefined;
       return free?.[quote] ?? 0;
     } catch (err) {
-      console.error("[Engine] fetchBalance failed:", err);
+      this.logger.error("[Engine] fetchBalance failed", { error: String(err) });
       return 0;
     }
   }

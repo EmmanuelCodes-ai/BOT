@@ -227,4 +227,5 @@ export interface BotConfig {
   minVolumeMultiplier: number; // minimum vol vs 20-period avg
   maxOpenTrades: number;
   paperTrading: boolean;
+  paperBalance: number;       // virtual account size for paper trading sizing
 }

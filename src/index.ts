@@ -58,7 +58,8 @@ function loadConfig(): BotConfig {
     h4Timeframe: "4h",
     minVolumeMultiplier: parseFloat(process.env.MIN_VOLUME_MULTIPLIER ?? "0.8"),
     maxOpenTrades: parseInt(process.env.MAX_OPEN_TRADES ?? "2", 10),
-    paperTrading: process.env.PAPER_TRADING !== "false", // default true
+    paperTrading: process.env.PAPER_TRADING !== "false",
+    paperBalance: parseFloat(process.env.PAPER_BALANCE ?? "10000"),
   };
 }
 
@@ -491,7 +492,7 @@ async function main(): Promise<void> {
 
   const strategies = buildStrategyRegistry();
   const classifier = new FlowClassifier(strategies);
-  const engine = new ExecutionEngine(exchange, config);
+  const engine = new ExecutionEngine(exchange, config, logger);
   const telegram = new TelegramNotifier();
 
   const bot = new TradingBot(config, exchange, classifier, engine, logger, telegram);
