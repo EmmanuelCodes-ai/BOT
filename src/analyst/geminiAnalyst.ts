@@ -93,7 +93,7 @@ function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
     const body = JSON.stringify({
       model: MODEL,
       messages,
-      max_tokens: 512,
+      max_tokens: 4096,
       temperature: 1,
       reasoning_effort: "max",
       stream: true,
