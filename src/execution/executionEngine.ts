@@ -537,10 +537,37 @@ export class ExecutionEngine {
     }
 
     try {
-      const balances = await this.exchange.fetchBalance();
-      const quote = this.config.symbol.split("/")[1] ?? "USDT";
-      const free = balances?.free as unknown as Record<string, number | undefined> | undefined;
-      const balance = free?.[quote] ?? 0;
+      // Bybit Unified Trading Account requires accountType=UNIFIED
+      const balances = await this.exchange.fetchBalance({ type: "unified" });
+      const quote = this.config.symbol.split("/")[1]?.split(":")[0] ?? "USDT";
+
+      this.logger.debug("[Engine] Raw balance response", {
+        total: balances?.total,
+        free: balances?.free,
+      });
+
+      // Try multiple balance fields Bybit may return
+      const total = (balances?.total as unknown as Record<string, number | undefined>)?.[quote];
+      const free = (balances?.free as unknown as Record<string, number | undefined>)?.[quote];
+      const balance = total ?? free ?? 0;
+
+      if (balance === 0) {
+        // Fallback: try USDT directly from info object
+        const info = (balances as any)?.info?.result?.list;
+        if (Array.isArray(info)) {
+          for (const account of info) {
+            if (account?.accountType === "UNIFIED") {
+              const coin = account?.coin?.find((c: any) => c?.coin === quote);
+              if (coin) {
+                const walletBalance = parseFloat(coin.walletBalance ?? "0");
+                this.snapshotDayStart(walletBalance);
+                return walletBalance;
+              }
+            }
+          }
+        }
+      }
+
       this.snapshotDayStart(balance);
       return balance;
     } catch (err) {
