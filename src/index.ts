@@ -5,16 +5,22 @@
 //   1. Load config from environment
 //   2. Connect to exchange (sandbox or live)
 //   3. Wire up all subsystems
-//   4. Enter the main loop — polls for new closed M5 candles
-//      within the NY session window (13:00–21:00 UTC)
+//   4. Enter the main loop — polls for new closed M5 candles 24/7
 //   5. On each new closed candle:
 //      a. Fetch H1/H4 context candles
 //      b. Run FlowClassifier → get signal or null
 //      c. Log the evaluation record
 //      d. If signal: log it, attempt execution
 //      e. Check all open trades for SL/TP hits
-//   6. On session end: force-close open trades + log summary
+//   6. Daily summary at 00:00 WAT (23:00 UTC) — read-only, never
+//      closes open trades
 //   7. Graceful shutdown on SIGINT/SIGTERM
+//
+// Notes on candle alignment:
+//   - M5 candles fetched from Bybit use NY-close alignment
+//     (candle day boundary at 17:00 UTC / midnight NY time).
+//   - VWAP resets daily at NY session open (13:00 UTC) so the
+//     deviation metric stays meaningful intraday.
 // ============================================================
 
 import "dotenv/config";
@@ -33,12 +39,7 @@ import { v4 as uuidv4 } from "uuid";
 // ============================================================
 
 function loadConfig(): BotConfig {
-  const required = [
-    "EXCHANGE_ID",
-    "API_KEY",
-    "API_SECRET",
-    "SYMBOL",
-  ];
+  const required = ["EXCHANGE_ID", "API_KEY", "API_SECRET", "SYMBOL"];
 
   for (const key of required) {
     if (!process.env[key]) {
@@ -52,6 +53,8 @@ function loadConfig(): BotConfig {
     riskPerTradePct: parseFloat(process.env.RISK_PER_TRADE_PCT ?? "0.01"),
     riskRewardRatio: parseFloat(process.env.RISK_REWARD_RATIO ?? "2"),
     atrMultiplierSL: parseFloat(process.env.ATR_MULTIPLIER_SL ?? "1.5"),
+    // NY session open hour (UTC) — used only to anchor the rolling VWAP.
+    // Does NOT gate trade execution.
     sessionStartUTC: parseInt(process.env.SESSION_START_UTC ?? "13", 10),
     sessionEndUTC: parseInt(process.env.SESSION_END_UTC ?? "21", 10),
     h1Timeframe: "1h",
@@ -83,8 +86,6 @@ function buildExchange(config: BotConfig): Exchange {
   const exchange: Exchange = new ExchangeClass({
     apiKey: process.env.API_KEY,
     secret: process.env.API_SECRET,
-    // Override all URLs to use api-demo.bybit.com when in demo mode.
-    // This bypasses geo-blocks on the standard api.bybit.com endpoint.
     ...(isDemoMode && {
       urls: {
         api: {
@@ -100,7 +101,6 @@ function buildExchange(config: BotConfig): Exchange {
     },
   });
 
-  // Force-disable fetchCurrencies at the instance level.
   (exchange as any).fetchCurrencies = async () => ({});
 
   const sandboxMode = process.env.SANDBOX_MODE === "true";
@@ -115,11 +115,6 @@ function buildExchange(config: BotConfig): Exchange {
 // 3. CCXT candle fetching helpers
 // ============================================================
 
-/**
- * Fetches the most recent `limit` closed candles for a given timeframe.
- * CCXT returns [timestamp, open, high, low, close, volume].
- * We request limit+1 and drop the last (potentially open) candle.
- */
 async function fetchClosedCandles(
   exchange: Exchange,
   symbol: string,
@@ -127,7 +122,6 @@ async function fetchClosedCandles(
   limit: number
 ): Promise<Candle[]> {
   const raw = await exchange.fetchOHLCV(symbol, timeframe, undefined, limit + 1);
-  // Drop the last candle — it may still be forming
   const closed = raw.slice(0, -1);
   return closed.map((c) => ({
     timestamp: c[0] as number,
@@ -140,44 +134,42 @@ async function fetchClosedCandles(
 }
 
 // ============================================================
-// 4. Session window helpers
+// 4. VWAP anchor — filter candles to current NY session
+//    Resets at 13:00 UTC (NY open) regardless of when the bot
+//    is running, so VWAP deviation always reflects the live
+//    intraday stretch from the NY open price anchor.
 // ============================================================
 
-/** Returns true when current UTC hour is inside the trading session */
-function isInsideSession(startHour: number, endHour: number): boolean {
-  const hour = new Date().getUTCHours();
-  return hour >= startHour && hour < endHour;
-}
-
-/** Returns true when current UTC hour is exactly the session end hour */
-function isSessionEnd(endHour: number): boolean {
+function filterNYSessionCandles(candles: Candle[], nyOpenHourUTC: number): Candle[] {
   const now = new Date();
-  return now.getUTCHours() === endHour && now.getUTCMinutes() === 0;
+
+  // Determine the most recent NY open timestamp
+  // If current UTC hour >= nyOpenHourUTC → today's open
+  // If current UTC hour < nyOpenHourUTC → yesterday's open
+  const utcHour = now.getUTCHours();
+  const dayOffset = utcHour >= nyOpenHourUTC ? 0 : -1;
+
+  const anchorDate = new Date(now);
+  anchorDate.setUTCDate(anchorDate.getUTCDate() + dayOffset);
+  anchorDate.setUTCHours(nyOpenHourUTC, 0, 0, 0);
+
+  const anchorTs = anchorDate.getTime();
+  return candles.filter((c) => c.timestamp >= anchorTs);
 }
 
 // ============================================================
-// 5. Filter session candles (for rolling VWAP)
+// 5. Daily summary trigger — fires once at 23:00 UTC (00:00 WAT)
+//    Read-only: never closes or modifies open trades.
 // ============================================================
 
-function filterSessionCandles(
-  candles: Candle[],
-  sessionStartHour: number
-): Candle[] {
+function isMidnightWAT(): boolean {
   const now = new Date();
-  const sessionStartToday = Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    sessionStartHour,
-    0,
-    0,
-    0
-  );
-  return candles.filter((c) => c.timestamp >= sessionStartToday);
+  // WAT = UTC+1 → midnight WAT = 23:00 UTC
+  return now.getUTCHours() === 23 && now.getUTCMinutes() === 0;
 }
 
 // ============================================================
-// 6. Main loop
+// 6. Main TradingBot class
 // ============================================================
 
 class TradingBot {
@@ -189,7 +181,7 @@ class TradingBot {
   private telegram: TelegramNotifier;
 
   private lastProcessedCandleTs: number = 0;
-  private sessionStartTs: number = 0;
+  private dailySummaryFiredDate: string = ""; // YYYY-MM-DD in WAT
   private running: boolean = false;
 
   constructor(
@@ -212,7 +204,6 @@ class TradingBot {
       this.logger.logTrade(trade);
 
       if (trade.outcome === "OPEN") {
-        // Extract score from the notes field: "Strategy: X | Flow: Y | Score: 85"
         const scoreMatch = trade.notes.match(/Score:\s*(\d+)/);
         const score = scoreMatch ? parseInt(scoreMatch[1], 10) : 0;
 
@@ -244,18 +235,18 @@ class TradingBot {
 
   async start(): Promise<void> {
     this.running = true;
-    this.logger.info("Bot started", {
+    this.logger.info("Bot started — running 24/7", {
       symbol: this.config.symbol,
       paperTrading: this.config.paperTrading,
-      session: `${this.config.sessionStartUTC}:00–${this.config.sessionEndUTC}:00 UTC`,
+      vwapAnchorUTC: `${this.config.sessionStartUTC}:00`,
+      dailySummaryWAT: "00:00 (23:00 UTC)",
     });
 
     this.telegram.notifyBotStarted(
       this.config.symbol,
-      `${this.config.sessionStartUTC}:00–${this.config.sessionEndUTC}:00 UTC`
+      "24/7 — daily summary at 00:00 WAT"
     );
 
-    // Register graceful shutdown
     process.on("SIGINT", () => this.shutdown("SIGINT"));
     process.on("SIGTERM", () => this.shutdown("SIGTERM"));
 
@@ -263,7 +254,7 @@ class TradingBot {
   }
 
   private async loop(): Promise<void> {
-    const POLL_INTERVAL_MS = 15_000; // check every 15 seconds
+    const POLL_INTERVAL_MS = 15_000;
 
     while (this.running) {
       try {
@@ -274,67 +265,18 @@ class TradingBot {
         });
       }
 
-      // Wait before next poll
       await sleep(POLL_INTERVAL_MS);
     }
   }
 
   private async tick(): Promise<void> {
-    const now = new Date();
-
-    // ── Session end — force-close and summarise ────────────
-    if (isSessionEnd(this.config.sessionEndUTC) && this.sessionStartTs > 0) {
-      this.logger.info("Session end reached — closing all open trades");
-      const lastPrice = await this.fetchLastPrice();
-      this.engine.closeAllAtMarket(lastPrice, "Session end 21:00 UTC");
-
-      this.logger.logSessionSummary(
-        this.engine.getClosedTrades(),
-        this.sessionStartTs,
-        Date.now()
-      );
-
-      const closed = this.engine.getClosedTrades();
-      const wins = closed.filter((t) => t.outcome === "WIN").length;
-      const losses = closed.filter((t) => t.outcome === "LOSS").length;
-      const totalR = closed.reduce((s, t) => s + (t.pnlR ?? 0), 0);
-      const totalPnl = closed.reduce((s, t) => s + (t.pnlRaw ?? 0), 0);
-      const winRate = wins + losses > 0
-        ? ((wins / (wins + losses)) * 100).toFixed(1)
-        : "0";
-
-      this.telegram.notifySessionSummary({
-        date: new Date().toLocaleDateString("en-NG", { timeZone: "Africa/Lagos" }),
-        totalTrades: closed.length,
-        wins,
-        losses,
-        totalR: parseFloat(totalR.toFixed(2)),
-        totalPnl: parseFloat(totalPnl.toFixed(4)),
-        winRate,
-      });
-
-      this.sessionStartTs = 0; // reset for next session
-      return;
+    // ── Daily summary — fires once at 23:00 UTC (00:00 WAT) ──
+    // Read-only: closed trades only, open positions untouched.
+    if (isMidnightWAT()) {
+      await this.fireDailySummary();
     }
 
-    // ── Outside session window — idle ─────────────────────
-    if (!isInsideSession(this.config.sessionStartUTC, this.config.sessionEndUTC)) {
-      this.logger.debug(
-        `Outside session window (${now.getUTCHours()}:${String(now.getUTCMinutes()).padStart(2, "0")} UTC) — waiting`
-      );
-      return;
-    }
-
-    // Mark session start for the summary
-    if (this.sessionStartTs === 0) {
-      this.sessionStartTs = Date.now();
-      this.logger.info("Session opened", {
-        utcTime: now.toISOString(),
-      });
-    }
-
-    // ── Fetch candles ──────────────────────────────────────
-    // 300 M5 candles ≈ 25 hours — enough for all indicators
+    // ── Fetch M5 candles (300 ≈ 25 hours) ─────────────────
     const m5Candles = await fetchClosedCandles(
       this.exchange,
       this.config.symbol,
@@ -351,28 +293,28 @@ class TradingBot {
 
     const latestCandle = m5Candles[m5Candles.length - 1];
 
-    // ── Deduplication — skip if we've already processed this candle ──
+    // ── Deduplication ──────────────────────────────────────
     if (latestCandle.timestamp <= this.lastProcessedCandleTs) {
-      return; // same candle, wait for the next close
+      return;
     }
 
     this.logger.debug(
       `New M5 candle: ${new Date(latestCandle.timestamp).toISOString()} close=${latestCandle.close}`
     );
 
-    // ── Fetch H1 / H4 context (100 candles each) ──────────
+    // ── Fetch H1 / H4 context ──────────────────────────────
     const [h1Candles, h4Candles] = await Promise.all([
       fetchClosedCandles(this.exchange, this.config.symbol, this.config.h1Timeframe, 100),
       fetchClosedCandles(this.exchange, this.config.symbol, this.config.h4Timeframe, 100),
     ]);
 
-    // ── Session VWAP candles ───────────────────────────────
-    const sessionCandles = filterSessionCandles(
+    // ── VWAP anchor: NY session candles only ───────────────
+    const nySessionCandles = filterNYSessionCandles(
       m5Candles,
       this.config.sessionStartUTC
     );
 
-    // ── Check open trades first ────────────────────────────
+    // ── Check open trades for SL/TP hits ──────────────────
     this.engine.checkOpenTrades(latestCandle);
 
     // ── Run flow classifier ────────────────────────────────
@@ -380,13 +322,13 @@ class TradingBot {
       m5Candles,
       h1Candles,
       h4Candles,
-      sessionCandles,
+      nySessionCandles,
       this.config.atrMultiplierSL,
       this.config.riskRewardRatio,
       this.config.symbol
     );
 
-    // ── Build evaluation record ────────────────────────────
+    // ── Build and log evaluation record ───────────────────
     const evalRecord: EvaluationRecord = {
       id: uuidv4(),
       timestamp: Date.now(),
@@ -425,9 +367,84 @@ class TradingBot {
       }
     }
 
-    // ── Mark candle as processed ───────────────────────────
     this.lastProcessedCandleTs = latestCandle.timestamp;
   }
+
+  // ──────────────────────────────────────────────────────────
+  // Daily summary — fires once per calendar day at 00:00 WAT
+  // Reads closed trades only. Open trades are never touched.
+  // ──────────────────────────────────────────────────────────
+
+  private async fireDailySummary(): Promise<void> {
+    // Build today's date string in WAT for deduplication
+    const watDate = new Date(Date.now() + 60 * 60 * 1000) // UTC+1
+      .toISOString()
+      .slice(0, 10); // YYYY-MM-DD
+
+    if (this.dailySummaryFiredDate === watDate) {
+      return; // already fired today
+    }
+
+    this.dailySummaryFiredDate = watDate;
+
+    const closedTrades = this.engine.getClosedTrades();
+    const openTrades = this.engine.getOpenTrades();
+
+    const wins = closedTrades.filter((t) => t.outcome === "WIN").length;
+    const losses = closedTrades.filter((t) => t.outcome === "LOSS").length;
+    const be = closedTrades.filter((t) => t.outcome === "BREAKEVEN").length;
+    const totalR = closedTrades.reduce((s, t) => s + (t.pnlR ?? 0), 0);
+    const totalPnl = closedTrades.reduce((s, t) => s + (t.pnlRaw ?? 0), 0);
+    const winRate =
+      wins + losses > 0
+        ? ((wins / (wins + losses)) * 100).toFixed(1)
+        : "0";
+
+    // Log to file
+    this.logger.logSessionSummary(closedTrades, Date.now() - 86_400_000, Date.now());
+
+    // Send Telegram — includes open trade count as context
+    this.telegram.notifySessionSummary({
+      date: `${watDate} (daily @ 00:00 WAT)`,
+      totalTrades: closedTrades.length,
+      wins,
+      losses,
+      totalR: parseFloat(totalR.toFixed(2)),
+      totalPnl: parseFloat(totalPnl.toFixed(4)),
+      winRate,
+    });
+
+    // Append open positions note
+    if (openTrades.length > 0) {
+      const openSummary = openTrades
+        .map(
+          (t) =>
+            `• ${t.direction} @ ${t.entryPrice} | SL=${t.stopLoss} | TP=${t.takeProfit}`
+        )
+        .join("\n");
+
+      this.telegram.isEnabled() && this.sendOpenPositionsNote(openSummary);
+    }
+
+    this.logger.info("Daily summary fired", {
+      date: watDate,
+      closedTrades: closedTrades.length,
+      openTrades: openTrades.length,
+      totalR,
+    });
+  }
+
+  private sendOpenPositionsNote(summary: string): void {
+    // Access internal send method via the notifier
+    // We reuse notifyError as an informal channel for the open positions note
+    this.telegram.notifyError(
+      `📋 <b>Open Positions at midnight WAT</b>\n${summary}\n\n<i>These positions were not modified.</i>`
+    );
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Helpers
+  // ──────────────────────────────────────────────────────────
 
   private async fetchLastPrice(): Promise<number> {
     try {
@@ -456,10 +473,10 @@ class TradingBot {
       }
     }
 
-    if (this.engine.getClosedTrades().length > 0 && this.sessionStartTs > 0) {
+    if (this.engine.getClosedTrades().length > 0) {
       this.logger.logSessionSummary(
         this.engine.getClosedTrades(),
-        this.sessionStartTs,
+        Date.now() - 86_400_000,
         Date.now()
       );
     }
@@ -474,7 +491,6 @@ class TradingBot {
 // ============================================================
 
 async function main(): Promise<void> {
-  // Start health check server immediately so Render marks the service as live
   const healthPort = parseInt(process.env.PORT ?? "3000", 10);
   startHealthServer(healthPort);
 
@@ -488,8 +504,6 @@ async function main(): Promise<void> {
     paperTrading: config.paperTrading,
   });
 
-  // Load markets — skip fetchCurrencies (coin/query-info) which is slow/unreliable.
-  // We only need the market symbols, not full currency metadata.
   await exchange.loadMarkets();
   logger.info("Markets loaded");
 
@@ -507,7 +521,6 @@ main().catch((err) => {
   process.exit(1);
 });
 
-// ── Utility ───────────────────────────────────────────────
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

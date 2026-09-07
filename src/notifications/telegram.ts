@@ -140,6 +140,10 @@ export class TelegramNotifier {
     sendMessage(this.token, this.chatId, msg);
   }
 
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
   notifyBotStarted(symbol: string, session: string): void {
     if (!this.enabled) return;
     sendMessage(
