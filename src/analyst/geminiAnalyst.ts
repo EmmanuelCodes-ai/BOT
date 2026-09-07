@@ -127,6 +127,11 @@ function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
       });
     });
 
+    req.setTimeout(30000, () => {
+      req.destroy();
+      reject(new Error("NIM request timed out after 30s"));
+    });
+
     req.on("error", reject);
     req.setTimeout(REQUEST_TIMEOUT_MS, () => {
       req.destroy(new Error(`NIM request timed out after ${REQUEST_TIMEOUT_MS}ms`));
