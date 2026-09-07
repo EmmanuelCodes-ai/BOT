@@ -212,7 +212,10 @@ class TradingBot {
       this.logger.logTrade(trade);
 
       if (trade.outcome === "OPEN") {
-        const score = trade.indicators ? 0 : 0;
+        // Extract score from the notes field: "Strategy: X | Flow: Y | Score: 85"
+        const scoreMatch = trade.notes.match(/Score:\s*(\d+)/);
+        const score = scoreMatch ? parseInt(scoreMatch[1], 10) : 0;
+
         this.telegram.notifyTradeOpen({
           id: trade.id,
           strategy: trade.strategyId,
