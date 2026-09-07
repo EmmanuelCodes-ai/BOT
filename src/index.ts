@@ -30,7 +30,7 @@ import { FlowClassifier } from "./classifier";
 import { ExecutionEngine } from "./execution";
 import { BotLogger } from "./logger";
 import { buildStrategyRegistry } from "./strategies";
-import { startHealthServer } from "./healthCheck";
+import { startHealthServer, registerTestSummaryCallback } from "./healthCheck";
 import { TelegramNotifier } from "./notifications";
 import { v4 as uuidv4 } from "uuid";
 
@@ -247,6 +247,9 @@ class TradingBot {
       "24/7 — daily summary at 00:00 WAT"
     );
 
+    // Register test summary endpoint
+    registerTestSummaryCallback(() => this.fireDailySummary(true));
+
     process.on("SIGINT", () => this.shutdown("SIGINT"));
     process.on("SIGTERM", () => this.shutdown("SIGTERM"));
 
@@ -375,13 +378,13 @@ class TradingBot {
   // Reads closed trades only. Open trades are never touched.
   // ──────────────────────────────────────────────────────────
 
-  private async fireDailySummary(): Promise<void> {
+  private async fireDailySummary(force: boolean = false): Promise<void> {
     // Build today's date string in WAT for deduplication
     const watDate = new Date(Date.now() + 60 * 60 * 1000) // UTC+1
       .toISOString()
       .slice(0, 10); // YYYY-MM-DD
 
-    if (this.dailySummaryFiredDate === watDate) {
+    if (!force && this.dailySummaryFiredDate === watDate) {
       return; // already fired today
     }
 
