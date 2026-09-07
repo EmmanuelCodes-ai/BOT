@@ -1,20 +1,20 @@
 // ============================================================
-// Gemini AI Analyst
+// AI Analyst — powered by DeepSeek via NVIDIA NIM
 //
-// Uses @google/genai SDK with gemini-2.5-flash model.
+// Uses OpenAI-compatible REST API (no extra SDK needed).
+// Model: deepseek-ai/deepseek-v4-pro-0813
 //
 // Two modes:
-//   1. Proactive — fires after trades and daily summary.
-//      Sends observations to Telegram only when worth flagging.
-//
-//   2. Chat — user messages the Telegram bot, Gemini replies
-//      with full live bot context.
+//   1. Proactive — fires after trades and daily summary
+//   2. Chat — user messages Telegram bot, AI replies with context
 // ============================================================
 
-import { GoogleGenAI } from "@google/genai";
-import { Trade, Signal } from "../types";
+import * as https from "https";
 
-// ── Bot context snapshot passed to Gemini ──────────────────
+const NIM_BASE_URL = "https://integrate.api.nvidia.com/v1";
+const MODEL = "deepseek-ai/deepseek-v4-pro-0813";
+
+// ── Bot context snapshot ────────────────────────────────────
 export interface BotContext {
   timestamp: string;
   symbol: string;
@@ -79,33 +79,75 @@ Your job:
 - Flag when the bot is trading against macro bias
 - Warn about drawdown patterns or consecutive losses
 - Praise good setups when warranted
-- Be direct and concise — no fluff
-- When chatting, answer questions about what the bot is doing and why
+- Be direct, concise, no fluff
+- Answer questions about what the bot is doing and why
 
-Keep responses under 200 words. Use plain text, no markdown since this goes to Telegram.`;
+Keep responses under 200 words. Plain text only — no markdown since this goes to Telegram.`;
 
-// ── Chat history entry ──────────────────────────────────────
+// ── Chat message type ───────────────────────────────────────
 interface ChatMessage {
-  role: "user" | "model";
-  parts: string;
+  role: "system" | "user" | "assistant";
+  content: string;
 }
 
+// ── HTTP helper ─────────────────────────────────────────────
+function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model: MODEL,
+      messages,
+      max_tokens: 400,
+      temperature: 0.7,
+    });
+
+    const options = {
+      hostname: "integrate.api.nvidia.com",
+      path: "/v1/chat/completions",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          const text = parsed?.choices?.[0]?.message?.content ?? "";
+          resolve(text.trim());
+        } catch {
+          reject(new Error(`Failed to parse NIM response: ${data.slice(0, 200)}`));
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── Analyst class ───────────────────────────────────────────
 export class GeminiAnalyst {
-  private ai: GoogleGenAI | null = null;
+  private apiKey: string;
   private enabled: boolean;
   private chatHistory: ChatMessage[] = [];
   private tradeHistory: BotContext["recentTrades"] = [];
 
   constructor() {
-    const apiKey = process.env.GEMINI_API_KEY ?? "";
-    this.enabled = Boolean(apiKey);
+    // Support both old GEMINI_API_KEY and new NVIDIA_API_KEY
+    this.apiKey = process.env.NVIDIA_API_KEY ?? process.env.GEMINI_API_KEY ?? "";
+    this.enabled = Boolean(this.apiKey);
 
     if (!this.enabled) {
-      console.warn("[Gemini] API key missing — analyst disabled");
-      return;
+      console.warn("[Analyst] No API key found — analyst disabled");
+    } else {
+      console.log("[Analyst] DeepSeek via NVIDIA NIM initialised");
     }
-
-    this.ai = new GoogleGenAI({ apiKey });
   }
 
   isEnabled(): boolean {
@@ -117,24 +159,30 @@ export class GeminiAnalyst {
   // ──────────────────────────────────────────────────────────
 
   async analyzeTradeOpen(
-    trade: Trade,
-    signal: Signal,
+    trade: any,
+    signal: any,
     context: BotContext
   ): Promise<string | null> {
-    if (!this.enabled || !this.ai) return null;
+    if (!this.enabled) return null;
 
-    const prompt = `A new trade just opened. Analyze it and flag any concerns.
+    const messages: ChatMessage[] = [
+      { role: "system", content: SYSTEM_PROMPT },
+      {
+        role: "user",
+        content: `A new trade just opened. Analyze it and flag any concerns.
 
-Context: ${JSON.stringify(context, null, 2)}
+Context: ${JSON.stringify(context)}
 
 Trade: ${trade.strategyId} ${trade.direction} @ ${trade.entryPrice}
 SL: ${trade.stopLoss} | TP: ${trade.takeProfit}
 Flow: ${signal.flow.flow} | Macro bias: ${signal.flow.macroBias}
 RSI: ${signal.indicators.rsi14.toFixed(1)} | VWAP dev: ${signal.indicators.vwap.deviationPct.toFixed(3)}% | Vol: ${signal.indicators.volumeMultiplier.toFixed(2)}x
 
-Is this a good setup? Flag any concerns briefly.`;
+Is this a good setup? Flag any concerns briefly.`,
+      },
+    ];
 
-    return await this.generate(prompt);
+    return await this.generate(messages);
   }
 
   // ──────────────────────────────────────────────────────────
@@ -142,10 +190,10 @@ Is this a good setup? Flag any concerns briefly.`;
   // ──────────────────────────────────────────────────────────
 
   async analyzeTradeClose(
-    trade: Trade,
+    trade: any,
     context: BotContext
   ): Promise<string | null> {
-    if (!this.enabled || !this.ai) return null;
+    if (!this.enabled) return null;
 
     this.tradeHistory.push({
       strategy: trade.strategyId,
@@ -158,19 +206,26 @@ Is this a good setup? Flag any concerns briefly.`;
       this.tradeHistory = this.tradeHistory.slice(-10);
     }
 
-    const prompt = `Trade closed. Review the result and recent pattern.
+    const messages: ChatMessage[] = [
+      { role: "system", content: SYSTEM_PROMPT },
+      {
+        role: "user",
+        content: `Trade closed. Review the result and recent pattern.
 
-Context: ${JSON.stringify(context, null, 2)}
+Context: ${JSON.stringify(context)}
 
 Closed: ${trade.strategyId} ${trade.direction} → ${trade.outcome}
-PnL: ${trade.pnlR?.toFixed(2)}R (${trade.pnlRaw?.toFixed(2)} USDT) | Duration: ${Math.round((trade.durationMs ?? 0) / 60000)}m
+PnL: ${(trade.pnlR ?? 0).toFixed(2)}R (${(trade.pnlRaw ?? 0).toFixed(2)} USDT)
+Duration: ${Math.round((trade.durationMs ?? 0) / 60000)}m
 
 Recent history:
 ${this.tradeHistory.map((t, i) => `${i + 1}. ${t.strategy} ${t.direction} → ${t.outcome} (${t.pnlR.toFixed(2)}R)`).join("\n")}
 
-Any patterns worth flagging?`;
+Any patterns worth flagging?`,
+      },
+    ];
 
-    return await this.generate(prompt);
+    return await this.generate(messages);
   }
 
   // ──────────────────────────────────────────────────────────
@@ -178,64 +233,54 @@ Any patterns worth flagging?`;
   // ──────────────────────────────────────────────────────────
 
   async analyzeDailySummary(context: BotContext): Promise<string | null> {
-    if (!this.enabled || !this.ai) return null;
+    if (!this.enabled) return null;
 
-    const prompt = `End of day. Give a brief performance review.
+    const messages: ChatMessage[] = [
+      { role: "system", content: SYSTEM_PROMPT },
+      {
+        role: "user",
+        content: `End of day. Give a brief performance review.
 
-Context: ${JSON.stringify(context, null, 2)}
+Context: ${JSON.stringify(context)}
 
-Cover: overall performance, which strategies worked/failed, risk concerns, and one recommendation for tomorrow. Under 150 words.`;
+Cover: overall performance, which strategies worked/failed, risk concerns, one recommendation for tomorrow. Under 150 words.`,
+      },
+    ];
 
-    return await this.generate(prompt);
+    return await this.generate(messages);
   }
 
   // ──────────────────────────────────────────────────────────
-  // Chat — user message → Gemini reply
+  // Chat — user message with full context
   // ──────────────────────────────────────────────────────────
 
   async chat(userMessage: string, context: BotContext): Promise<string> {
-    if (!this.enabled || !this.ai) return "Gemini analyst is not configured.";
+    if (!this.enabled) return "AI analyst is not configured.";
+
+    // Build messages with history
+    const messages: ChatMessage[] = [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...this.chatHistory,
+      {
+        role: "user",
+        content: `Current bot state:\n${JSON.stringify(context)}\n\nUser: ${userMessage}`,
+      },
+    ];
 
     try {
-      const model = this.ai.models;
+      const reply = await nimRequest(messages, this.apiKey);
 
-      // Build contents array from history + new message
-      const contents = [
-        ...this.chatHistory.map((m) => ({
-          role: m.role,
-          parts: [{ text: m.parts }],
-        })),
-        {
-          role: "user" as const,
-          parts: [
-            {
-              text: `Current bot state:\n${JSON.stringify(context, null, 2)}\n\nUser: ${userMessage}`,
-            },
-          ],
-        },
-      ];
-
-      const response = await model.generateContent({
-        model: "gemini-2.5-flash",
-        contents,
-        config: { systemInstruction: SYSTEM_PROMPT },
-      });
-
-      const reply = response.text ?? "No response.";
-
-      // Store in history for context continuity
-      this.chatHistory.push({ role: "user", parts: userMessage });
-      this.chatHistory.push({ role: "model", parts: reply });
-
-      // Keep last 10 exchanges
+      // Store history for continuity (keep last 10 exchanges)
+      this.chatHistory.push({ role: "user", content: userMessage });
+      this.chatHistory.push({ role: "assistant", content: reply });
       if (this.chatHistory.length > 20) {
         this.chatHistory = this.chatHistory.slice(-20);
       }
 
-      return reply;
+      return reply || "No response from AI.";
     } catch (err: any) {
-      console.error("[Gemini] Chat error:", err.message);
-      this.chatHistory = []; // reset on error
+      console.error("[Analyst] Chat error:", err.message);
+      this.chatHistory = [];
       return `Sorry, I ran into an error: ${err.message}`;
     }
   }
@@ -244,20 +289,12 @@ Cover: overall performance, which strategies worked/failed, risk concerns, and o
   // Private: one-shot generation
   // ──────────────────────────────────────────────────────────
 
-  private async generate(prompt: string): Promise<string | null> {
-    if (!this.ai) return null;
-
+  private async generate(messages: ChatMessage[]): Promise<string | null> {
     try {
-      const response = await this.ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        config: { systemInstruction: SYSTEM_PROMPT },
-      });
-
-      const text = response.text?.trim() ?? "";
+      const text = await nimRequest(messages, this.apiKey);
       return text.length > 10 ? text : null;
     } catch (err: any) {
-      console.error("[Gemini] Generation error:", err.message);
+      console.error("[Analyst] Generation error:", err.message);
       return null;
     }
   }
