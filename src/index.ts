@@ -412,6 +412,8 @@ class TradingBot {
       totalR: parseFloat(totalR.toFixed(2)),
       totalPnl: parseFloat(totalPnl.toFixed(4)),
       winRate,
+      openingBalance: this.engine.getDayStartBalance(),
+      closingBalance: this.engine.getCurrentBalance(),
     });
 
     // Append open positions note

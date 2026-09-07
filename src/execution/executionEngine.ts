@@ -32,6 +32,8 @@ interface ExecutionState {
   lastOrderCandleTs: number;
   openTrades: Map<string, Trade>;
   closedTrades: Trade[];
+  dayStartBalance: number;   // balance snapshotted at first fetch of the day
+  dayStartDate: string;      // YYYY-MM-DD in WAT to detect day rollover
 }
 
 // ── Sanity check result ─────────────────────────────────────
@@ -56,6 +58,8 @@ export class ExecutionEngine {
       lastOrderCandleTs: 0,
       openTrades: new Map(),
       closedTrades: [],
+      dayStartBalance: 0,
+      dayStartDate: "",
     };
   }
 
@@ -247,6 +251,29 @@ export class ExecutionEngine {
 
   getOpenTradeCount(): number {
     return this.state.openTrades.size;
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Public: balance tracking
+  // ──────────────────────────────────────────────────────────
+
+  getDayStartBalance(): number {
+    return this.state.dayStartBalance;
+  }
+
+  /**
+   * Returns the current balance: paper balance adjusted by
+   * all closed trade PnL accumulated today.
+   */
+  getCurrentBalance(): number {
+    const totalPnl = this.state.closedTrades.reduce(
+      (s, t) => s + (t.pnlRaw ?? 0),
+      0
+    );
+    const base = this.state.dayStartBalance > 0
+      ? this.state.dayStartBalance
+      : this.config.paperBalance;
+    return parseFloat((base + totalPnl).toFixed(4));
   }
 
   // ──────────────────────────────────────────────────────────
@@ -486,17 +513,40 @@ export class ExecutionEngine {
 
   private async fetchBalance(): Promise<number> {
     if (this.config.paperTrading) {
-      return this.config.paperBalance;
+      const balance = this.config.paperBalance;
+      this.snapshotDayStart(balance);
+      return balance;
     }
 
     try {
       const balances = await this.exchange.fetchBalance();
       const quote = this.config.symbol.split("/")[1] ?? "USDT";
       const free = balances?.free as unknown as Record<string, number | undefined> | undefined;
-      return free?.[quote] ?? 0;
+      const balance = free?.[quote] ?? 0;
+      this.snapshotDayStart(balance);
+      return balance;
     } catch (err) {
       this.logger.error("[Engine] fetchBalance failed", { error: String(err) });
       return 0;
+    }
+  }
+
+  /**
+   * Snapshots the opening balance once per WAT calendar day.
+   * WAT = UTC+1, so midnight WAT = 23:00 UTC previous day.
+   */
+  private snapshotDayStart(balance: number): void {
+    const watDate = new Date(Date.now() + 60 * 60 * 1000)
+      .toISOString()
+      .slice(0, 10); // YYYY-MM-DD in WAT
+
+    if (this.state.dayStartDate !== watDate) {
+      this.state.dayStartDate = watDate;
+      this.state.dayStartBalance = balance;
+      this.logger.info("[Engine] Day start balance snapshot", {
+        date: watDate,
+        balance,
+      });
     }
   }
 }

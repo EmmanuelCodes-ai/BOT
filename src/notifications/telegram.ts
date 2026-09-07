@@ -122,20 +122,33 @@ export class TelegramNotifier {
     totalR: number;
     totalPnl: number;
     winRate: string;
+    openingBalance: number;
+    closingBalance: number;
   }): void {
     if (!this.enabled) return;
 
     const emoji = params.totalR >= 0 ? "📈" : "📉";
+    const balanceChange = params.closingBalance - params.openingBalance;
+    const balanceChangePct =
+      params.openingBalance > 0
+        ? ((balanceChange / params.openingBalance) * 100).toFixed(2)
+        : "0.00";
+    const balSign = balanceChange >= 0 ? "+" : "";
 
     const msg =
-      `${emoji} <b>SESSION SUMMARY</b>\n` +
+      `${emoji} <b>DAILY SUMMARY</b>\n` +
       `${params.date}\n\n` +
+      `💰 <b>Account</b>\n` +
+      `Opening  : $${params.openingBalance.toFixed(2)}\n` +
+      `Closing  : $${params.closingBalance.toFixed(2)}\n` +
+      `Change   : ${balSign}$${balanceChange.toFixed(2)} (${balSign}${balanceChangePct}%)\n\n` +
+      `📊 <b>Performance</b>\n` +
       `Trades   : ${params.totalTrades}\n` +
       `Wins     : ${params.wins}\n` +
       `Losses   : ${params.losses}\n` +
       `Win Rate : ${params.winRate}%\n` +
       `Total R  : ${params.totalR >= 0 ? "+" : ""}${params.totalR.toFixed(2)}R\n` +
-      `Total PnL: ${params.totalPnl >= 0 ? "+" : ""}${params.totalPnl.toFixed(4)}`;
+      `Total PnL: ${params.totalPnl >= 0 ? "+" : ""}$${params.totalPnl.toFixed(4)}`;
 
     sendMessage(this.token, this.chatId, msg);
   }
