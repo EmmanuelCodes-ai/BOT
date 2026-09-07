@@ -496,7 +496,12 @@ export class ExecutionEngine {
         slSide,
         size,
         sl,
-        { stopPrice: sl, reduceOnly: true }
+        {
+          stopPrice: sl,
+          reduceOnly: true,
+          // triggerDirection: 2 = below (for LONG SL), 1 = above (for SHORT SL)
+          triggerDirection: side === "buy" ? 2 : 1,
+        }
       );
 
       // ── Take-profit order ─────────────────────────────
@@ -506,7 +511,12 @@ export class ExecutionEngine {
         slSide,
         size,
         tp,
-        { stopPrice: tp, reduceOnly: true }
+        {
+          stopPrice: tp,
+          reduceOnly: true,
+          // triggerDirection: 1 = above (for LONG TP), 2 = below (for SHORT TP)
+          triggerDirection: side === "buy" ? 1 : 2,
+        }
       );
 
       order.status = OrderStatus.FILLED;
