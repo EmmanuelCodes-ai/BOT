@@ -1,79 +1,163 @@
 // ============================================================
-// AI Analyst — DeepSeek via NVIDIA NIM
-// Model: deepseek-ai/deepseek-v4-pro
+// AI Analyst — powered by Kimi K3 via NVIDIA NIM
+//
+// Model: moonshotai/kimi-k3
+// API: https://integrate.api.nvidia.com/v1/chat/completions
 // ============================================================
 
 import * as https from "https";
 
-const MODEL = "deepseek-ai/deepseek-v4-pro";
-const REQUEST_TIMEOUT_MS = 30000;
+const NIM_HOST = "integrate.api.nvidia.com";
+const NIM_PATH = "/v1/chat/completions";
+const MODEL = "moonshotai/kimi-k3";
 
+// ── Bot context snapshot ────────────────────────────────────
 export interface BotContext {
   timestamp: string;
   symbol: string;
-  balance: { opening: number; current: number; changePct: number };
-  session: { closedTrades: number; wins: number; losses: number; totalR: number; winRate: string };
-  openTrades: { direction: string; entryPrice: number; stopLoss: number; takeProfit: number; strategy: string; openedMinsAgo: number }[];
-  lastSignal: { strategy: string; direction: string; score: number; flow: string; macroBias: string; rsi: number; atr: number; vwapDevPct: number; volumeMultiplier: number; entry: number; sl: number; tp: number } | null;
+  balance: {
+    opening: number;
+    current: number;
+    changePct: number;
+  };
+  session: {
+    closedTrades: number;
+    wins: number;
+    losses: number;
+    totalR: number;
+    winRate: string;
+  };
+  openTrades: {
+    direction: string;
+    entryPrice: number;
+    stopLoss: number;
+    takeProfit: number;
+    strategy: string;
+    openedMinsAgo: number;
+  }[];
+  lastSignal: {
+    strategy: string;
+    direction: string;
+    score: number;
+    flow: string;
+    macroBias: string;
+    rsi: number;
+    atr: number;
+    vwapDevPct: number;
+    volumeMultiplier: number;
+    entry: number;
+    sl: number;
+    tp: number;
+  } | null;
   currentFlow: string;
-  recentTrades: { strategy: string; direction: string; outcome: string; pnlR: number; durationMin: number }[];
+  recentTrades: {
+    strategy: string;
+    direction: string;
+    outcome: string;
+    pnlR: number;
+    durationMin: number;
+  }[];
 }
 
-const SYSTEM_PROMPT = `You are an expert algorithmic trading analyst monitoring a live automated trading bot that trades BTC/USDT perpetual futures on Bybit using 5 strategies: TREND_PULLBACK_EMA, SR_FLIP_INVERSION, BB_MEAN_REVERSION, LIQUIDITY_SWEEP_REVERSAL, VWAP_DEVIATION_REVERSAL. Risk: 2R target, ATR stops, 1% account risk per trade. Be direct, concise, no markdown formatting.`;
+// ── System prompt ───────────────────────────────────────────
+const SYSTEM_PROMPT = `You are an expert algorithmic trading analyst monitoring a live automated trading bot.
 
+The bot trades BTC/USDT perpetual futures on Bybit using 5 strategies:
+1. TREND_PULLBACK_EMA — EMA confluence pullback in trending markets
+2. SR_FLIP_INVERSION — Support/Resistance flip retest
+3. BB_MEAN_REVERSION — Bollinger Band overextension fade (RSI confirmed)
+4. LIQUIDITY_SWEEP_REVERSAL — Stop hunt detection and reversal
+5. VWAP_DEVIATION_REVERSAL — Session VWAP stretch fade
+
+Risk management: 2R target, ATR-based stops, 1% account risk per trade, max 2 open trades.
+
+Your job:
+- Identify logical inconsistencies, risk issues, or strategy misfires
+- Flag when the bot is trading against macro bias
+- Warn about drawdown patterns or consecutive losses
+- Praise good setups when warranted
+- Be direct and concise, no fluff
+- Answer questions about what the bot is doing and why
+
+Keep responses under 200 words. Plain text only, no markdown since this goes to Telegram.`;
+
+// ── Message type ────────────────────────────────────────────
 interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
 }
 
+// ── HTTP request with SSE streaming support ─────────────────
 function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
       model: MODEL,
       messages,
-      max_tokens: 400,
-      temperature: 0.7,
-      stream: false,
+      max_tokens: 512,
+      temperature: 1,
+      reasoning_effort: "max",
+      stream: true,
     });
 
-    const req = https.request(
-      {
-        hostname: "integrate.api.nvidia.com",
-        path: "/v1/chat/completions",
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Length": Buffer.byteLength(body),
-        },
+    const options = {
+      hostname: NIM_HOST,
+      path: NIM_PATH,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "Accept": "text/event-stream",
+        "Content-Length": Buffer.byteLength(body),
       },
-      (res) => {
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => {
-          try {
-            console.log("[Analyst] HTTP status:", res.statusCode);
-            console.log("[Analyst] Raw response:", data.slice(0, 400));
-            const parsed = JSON.parse(data);
-            const text = parsed?.choices?.[0]?.message?.content ?? "";
-            resolve(text.trim());
-          } catch (e) {
-            reject(new Error(`Failed to parse: ${data.slice(0, 200)}`));
-          }
-        });
-      }
-    );
+    };
 
-    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
-      req.destroy(new Error("NIM request timed out after 30s"));
+    const req = https.request(options, (res) => {
+      let fullText = "";
+      let rawBuffer = "";
+
+      res.on("data", (chunk: Buffer) => {
+        rawBuffer += chunk.toString("utf8");
+        const lines = rawBuffer.split("\n");
+        rawBuffer = lines.pop() ?? ""; // keep incomplete line in buffer
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === "data: [DONE]") continue;
+          if (!trimmed.startsWith("data: ")) continue;
+
+          try {
+            const json = JSON.parse(trimmed.slice(6));
+            const delta = json?.choices?.[0]?.delta?.content ?? "";
+            fullText += delta;
+          } catch {
+            // skip malformed chunks
+          }
+        }
+      });
+
+      res.on("end", () => {
+        const result = fullText.trim();
+        console.log(`[Analyst] Response received (${result.length} chars)`);
+        resolve(result);
+      });
+
+      res.on("error", reject);
     });
 
     req.on("error", reject);
+
+    // 60 second timeout
+    req.setTimeout(60000, () => {
+      req.destroy();
+      reject(new Error("NIM request timed out after 60s"));
+    });
+
     req.write(body);
     req.end();
   });
 }
 
+// ── Analyst class ───────────────────────────────────────────
 export class GeminiAnalyst {
   private apiKey: string;
   private enabled: boolean;
@@ -81,12 +165,13 @@ export class GeminiAnalyst {
   private tradeHistory: BotContext["recentTrades"] = [];
 
   constructor() {
-    this.apiKey = process.env.NVIDIA_API_KEY ?? process.env.GEMINI_API_KEY ?? "";
+    this.apiKey = process.env.NVIDIA_API_KEY ?? "";
     this.enabled = Boolean(this.apiKey);
+
     if (!this.enabled) {
-      console.warn("[Analyst] No API key found — analyst disabled");
+      console.warn("[Analyst] NVIDIA_API_KEY missing — analyst disabled");
     } else {
-      console.log("[Analyst] DeepSeek via NVIDIA NIM initialised");
+      console.log(`[Analyst] Kimi K3 via NVIDIA NIM initialised`);
     }
   }
 
@@ -94,51 +179,114 @@ export class GeminiAnalyst {
     return this.enabled;
   }
 
+  // ──────────────────────────────────────────────────────────
+  // Proactive: trade opened
+  // ──────────────────────────────────────────────────────────
+
   async analyzeTradeOpen(trade: any, signal: any, context: BotContext): Promise<string | null> {
     if (!this.enabled) return null;
-    return this.generate([
+
+    return await this.generate([
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: `New trade opened. Analyze briefly.\n\nContext: ${JSON.stringify(context)}\n\nTrade: ${trade.strategyId} ${trade.direction} @ ${trade.entryPrice} SL=${trade.stopLoss} TP=${trade.takeProfit} Flow=${signal.flow.flow} Bias=${signal.flow.macroBias} RSI=${signal.indicators.rsi14.toFixed(1)} VWAP=${signal.indicators.vwap.deviationPct.toFixed(2)}% Vol=${signal.indicators.volumeMultiplier.toFixed(2)}x` },
+      {
+        role: "user",
+        content: `New trade opened. Analyze and flag concerns.
+
+Context: ${JSON.stringify(context)}
+
+Trade: ${trade.strategyId} ${trade.direction} @ ${trade.entryPrice}
+SL: ${trade.stopLoss} | TP: ${trade.takeProfit}
+Flow: ${signal.flow.flow} | Macro: ${signal.flow.macroBias}
+RSI: ${signal.indicators.rsi14.toFixed(1)} | VWAP dev: ${signal.indicators.vwap.deviationPct.toFixed(3)}% | Vol: ${signal.indicators.volumeMultiplier.toFixed(2)}x`,
+      },
     ]);
   }
+
+  // ──────────────────────────────────────────────────────────
+  // Proactive: trade closed
+  // ──────────────────────────────────────────────────────────
 
   async analyzeTradeClose(trade: any, context: BotContext): Promise<string | null> {
     if (!this.enabled) return null;
-    this.tradeHistory.push({ strategy: trade.strategyId, direction: trade.direction, outcome: trade.outcome, pnlR: trade.pnlR ?? 0, durationMin: Math.round((trade.durationMs ?? 0) / 60000) });
+
+    this.tradeHistory.push({
+      strategy: trade.strategyId,
+      direction: trade.direction,
+      outcome: trade.outcome,
+      pnlR: trade.pnlR ?? 0,
+      durationMin: Math.round((trade.durationMs ?? 0) / 60000),
+    });
     if (this.tradeHistory.length > 10) this.tradeHistory = this.tradeHistory.slice(-10);
-    return this.generate([
+
+    return await this.generate([
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: `Trade closed: ${trade.strategyId} ${trade.direction} → ${trade.outcome} ${(trade.pnlR ?? 0).toFixed(2)}R ${Math.round((trade.durationMs ?? 0) / 60000)}m\n\nRecent: ${this.tradeHistory.map((t, i) => `${i + 1}.${t.strategy} ${t.direction}→${t.outcome}(${t.pnlR.toFixed(1)}R)`).join(" ")}\n\nContext: ${JSON.stringify(context)}\n\nAny patterns?` },
+      {
+        role: "user",
+        content: `Trade closed. Review result and pattern.
+
+Context: ${JSON.stringify(context)}
+
+Closed: ${trade.strategyId} ${trade.direction} → ${trade.outcome}
+PnL: ${(trade.pnlR ?? 0).toFixed(2)}R (${(trade.pnlRaw ?? 0).toFixed(2)} USDT) | Duration: ${Math.round((trade.durationMs ?? 0) / 60000)}m
+
+Recent history:
+${this.tradeHistory.map((t, i) => `${i + 1}. ${t.strategy} ${t.direction} → ${t.outcome} (${t.pnlR.toFixed(2)}R)`).join("\n")}`,
+      },
     ]);
   }
+
+  // ──────────────────────────────────────────────────────────
+  // Proactive: daily summary
+  // ──────────────────────────────────────────────────────────
 
   async analyzeDailySummary(context: BotContext): Promise<string | null> {
     if (!this.enabled) return null;
-    return this.generate([
+
+    return await this.generate([
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: `Daily review. Context: ${JSON.stringify(context)}\n\nCover: performance, strategy attribution, risk concerns, one recommendation. Under 150 words.` },
+      {
+        role: "user",
+        content: `End of day review. Context: ${JSON.stringify(context)}
+
+Cover: performance, strategy breakdown, risk concerns, one recommendation. Under 150 words.`,
+      },
     ]);
   }
 
+  // ──────────────────────────────────────────────────────────
+  // Chat
+  // ──────────────────────────────────────────────────────────
+
   async chat(userMessage: string, context: BotContext): Promise<string> {
-    if (!this.enabled) return "AI analyst not configured.";
+    if (!this.enabled) return "AI analyst is not configured. Add NVIDIA_API_KEY to Railway variables.";
+
+    const messages: ChatMessage[] = [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...this.chatHistory,
+      {
+        role: "user",
+        content: `Bot state: ${JSON.stringify(context)}\n\nUser: ${userMessage}`,
+      },
+    ];
+
     try {
-      const messages: ChatMessage[] = [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...this.chatHistory,
-        { role: "user", content: `Bot state: ${JSON.stringify(context)}\n\nUser: ${userMessage}` },
-      ];
       const reply = await nimRequest(messages, this.apiKey);
+
       this.chatHistory.push({ role: "user", content: userMessage });
       this.chatHistory.push({ role: "assistant", content: reply });
       if (this.chatHistory.length > 20) this.chatHistory = this.chatHistory.slice(-20);
+
       return reply || "No response from AI.";
     } catch (err: any) {
       console.error("[Analyst] Chat error:", err.message);
       this.chatHistory = [];
-      return `Error: ${err.message}`;
+      return `AI error: ${err.message}`;
     }
   }
+
+  // ──────────────────────────────────────────────────────────
+  // Private: generate
+  // ──────────────────────────────────────────────────────────
 
   private async generate(messages: ChatMessage[]): Promise<string | null> {
     try {
@@ -150,4 +298,3 @@ export class GeminiAnalyst {
     }
   }
 }
-
