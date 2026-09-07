@@ -25,7 +25,13 @@
 
 import "dotenv/config";
 import ccxt, { Exchange } from "ccxt";
-import { BotConfig, Candle, EvaluationRecord } from "./types";
+import {
+  BotConfig,
+  Candle,
+  EvaluationRecord,
+  IndicatorSnapshot,
+  FlowClassification,
+} from "./types";
 import { FlowClassifier } from "./classifier";
 import { ExecutionEngine } from "./execution";
 import { BotLogger } from "./logger";
@@ -183,11 +189,16 @@ class TradingBot {
   private telegram: TelegramNotifier;
   private analyst: GeminiAnalyst;
   private poller: TelegramPoller | null = null;
-  private lastSignal: any = null; // stored for Gemini context
-
   private lastProcessedCandleTs: number = 0;
   private dailySummaryFiredDate: string = "";
   private running: boolean = false;
+
+  private latestCandles: Candle[] = [];
+  private latestIndicators: IndicatorSnapshot | null = null;
+  private latestFlow: FlowClassification | null = null;
+  private latestEvaluation: EvaluationRecord | null = null;
+  private lastSignal: any = null;
+  private lastPrice: number = 0;
 
   constructor(
     config: BotConfig,
@@ -394,6 +405,13 @@ class TradingBot {
 
     this.logger.logEvaluation(evalRecord);
 
+    // ── Save latest telemetry for AI context ───────────────
+    this.latestCandles = m5Candles;
+    this.lastPrice = latestCandle.close;
+    this.latestFlow = output.flow;
+    this.latestIndicators = output.indicators;
+    this.latestEvaluation = evalRecord;
+
     // ── Execute signal if present ──────────────────────────
     if (output.signal) {
       this.lastSignal = output.signal; // store for Gemini context
@@ -500,37 +518,125 @@ class TradingBot {
   }
 
   private buildContext(): BotContext {
-    const closed = this.engine.getClosedTrades();
-    const open = this.engine.getOpenTrades();
-    const opening = this.engine.getDayStartBalance();
-    const current = this.engine.getCurrentBalance();
+    const ledger = this.engine.getLedger();
+    const financialSnap = ledger.getFinancialSnapshot(this.engine.getDayStartBalance());
+    const openPositions = ledger.getOpenPositions();
+    const closedTrades = ledger.getClosedTrades();
+
+    // Build recent candles summary (last 10 closed M5 bars)
+    const recent = this.latestCandles.slice(-10);
+    const recentCandles = recent.map((c, i) => {
+      const prev = i > 0 ? recent[i - 1] : null;
+      const changePct = prev && prev.close > 0
+        ? parseFloat((((c.close - prev.close) / prev.close) * 100).toFixed(2))
+        : 0;
+      const type: "BULLISH" | "BEARISH" | "DOJI" =
+        c.close > c.open ? "BULLISH" : c.close < c.open ? "BEARISH" : "DOJI";
+      const timeStr = new Date(c.timestamp).toISOString().slice(11, 16) + " UTC";
+      return {
+        time: timeStr,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: parseFloat(c.volume.toFixed(3)),
+        type,
+        changePct,
+      };
+    });
+
+    const ind = this.latestIndicators;
+    const emaAlignment = ind
+      ? ind.ema.ema9 > ind.ema.ema21 && ind.ema.ema21 > ind.ema.ema50 && ind.ema.ema50 > ind.ema.ema200
+        ? "BULLISH_STACK (9>21>50>200)"
+        : ind.ema.ema9 < ind.ema.ema21 && ind.ema.ema21 < ind.ema.ema50 && ind.ema.ema50 < ind.ema.ema200
+        ? "BEARISH_STACK (9<21<50<200)"
+        : "MIXED/CONSOLIDATING"
+      : "UNKNOWN";
+
+    const rsiStatus = ind
+      ? ind.rsi14 >= 70
+        ? "OVERBOUGHT (>70)"
+        : ind.rsi14 <= 30
+        ? "OVERSOLD (<30)"
+        : "NEUTRAL"
+      : "UNKNOWN";
+
+    const technicals = {
+      price: this.lastPrice || (recent[recent.length - 1]?.close ?? 0),
+      ema9: ind?.ema.ema9 ?? 0,
+      ema21: ind?.ema.ema21 ?? 0,
+      ema50: ind?.ema.ema50 ?? 0,
+      ema200: ind?.ema.ema200 ?? 0,
+      emaAlignment,
+      rsi14: ind ? parseFloat(ind.rsi14.toFixed(1)) : 0,
+      rsiStatus,
+      atr14: ind ? parseFloat(ind.atr14.toFixed(2)) : 0,
+      vwap: ind ? parseFloat(ind.vwap.vwap.toFixed(2)) : 0,
+      vwapDeviationPct: ind ? parseFloat(ind.vwap.deviationPct.toFixed(3)) : 0,
+      bollingerUpper: ind ? parseFloat(ind.bollinger.upper.toFixed(2)) : 0,
+      bollingerMiddle: ind ? parseFloat(ind.bollinger.middle.toFixed(2)) : 0,
+      bollingerLower: ind ? parseFloat(ind.bollinger.lower.toFixed(2)) : 0,
+      bollingerBandwidthPct: ind ? parseFloat((ind.bollinger.bandwidth * 100).toFixed(2)) : 0,
+      bollingerPercentB: ind ? parseFloat(ind.bollinger.percentB.toFixed(3)) : 0,
+      volumeMultiplier: ind ? parseFloat(ind.volumeMultiplier.toFixed(2)) : 1,
+    };
+
+    const flow = this.latestFlow;
+    const multiTimeframe = {
+      m5Flow: flow?.flow ?? "UNKNOWN",
+      m5Confidence: flow?.confidence ?? 0,
+      h1Bias: flow?.h1Bias ?? "NEUTRAL",
+      h4Bias: flow?.h4Bias ?? "NEUTRAL",
+      macroBias: flow?.macroBias ?? "NEUTRAL",
+    };
+
+    const strategyScores = this.latestEvaluation?.strategyScores.map((s) => ({
+      strategyId: s.strategyId,
+      score: s.score,
+      triggered: s.triggered,
+      reason: s.reason,
+    })) ?? [];
 
     return {
       timestamp: new Date().toISOString(),
       symbol: this.config.symbol,
-      balance: {
-        opening,
-        current,
-        changePct: opening > 0
-          ? parseFloat(((current - opening) / opening * 100).toFixed(2))
-          : 0,
+      chart: {
+        lastPrice: technicals.price,
+        recentCandles,
+        technicals,
+        multiTimeframe,
+        strategyScores,
       },
-      session: {
-        closedTrades: closed.length,
-        wins: closed.filter((t) => t.outcome === "WIN").length,
-        losses: closed.filter((t) => t.outcome === "LOSS").length,
-        totalR: parseFloat(closed.reduce((s, t) => s + (t.pnlR ?? 0), 0).toFixed(2)),
-        winRate: closed.length > 0
-          ? ((closed.filter((t) => t.outcome === "WIN").length / closed.length) * 100).toFixed(1)
-          : "0",
-      },
-      openTrades: open.map((t) => ({
-        direction: t.direction,
-        entryPrice: t.entryPrice,
-        stopLoss: t.stopLoss,
-        takeProfit: t.takeProfit,
+      financials: financialSnap,
+      openPositions: openPositions.map((p) => ({
+        id: p.id,
+        symbol: p.symbol,
+        direction: p.direction,
+        strategy: p.strategyId,
+        size: p.size,
+        entryPrice: p.entryPrice,
+        currentPrice: p.currentPrice,
+        stopLoss: p.stopLoss,
+        takeProfit: p.takeProfit,
+        riskUSD: p.riskUSD,
+        targetUSD: p.targetUSD,
+        unrealizedPnLUSD: p.unrealizedPnLUSD,
+        unrealizedPnLPct: p.unrealizedPnLPct,
+        unrealizedR: p.unrealizedR,
+        openedMinsAgo: p.durationMinutes,
+      })),
+      recentClosedTrades: closedTrades.slice(-10).map((t) => ({
+        id: t.id,
         strategy: t.strategyId,
-        openedMinsAgo: Math.round((Date.now() - t.openedAt) / 60000),
+        direction: t.direction,
+        outcome: t.outcome,
+        entryPrice: t.entryPrice,
+        exitPrice: t.exitPrice,
+        realizedPnLUSD: t.realizedPnLUSD,
+        pnlR: t.realizedPnLR,
+        durationMin: t.durationMinutes,
+        notes: t.notes,
       })),
       lastSignal: this.lastSignal
         ? {
@@ -548,14 +654,6 @@ class TradingBot {
             tp: this.lastSignal.takeProfit,
           }
         : null,
-      currentFlow: "UNKNOWN",
-      recentTrades: closed.slice(-5).map((t) => ({
-        strategy: t.strategyId,
-        direction: t.direction,
-        outcome: t.outcome,
-        pnlR: t.pnlR ?? 0,
-        durationMin: Math.round((t.durationMs ?? 0) / 60000),
-      })),
     };
   }
 

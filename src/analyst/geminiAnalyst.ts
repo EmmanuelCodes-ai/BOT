@@ -11,29 +11,99 @@ const NIM_HOST = "integrate.api.nvidia.com";
 const NIM_PATH = "/v1/chat/completions";
 const MODEL = "moonshotai/kimi-k3";
 
-// ── Bot context snapshot ────────────────────────────────────
+// ── Bot context snapshot & telemetry ────────────────────────
+
+export interface CandleSummary {
+  time: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  type: "BULLISH" | "BEARISH" | "DOJI";
+  changePct: number;
+}
+
+export interface TechnicalsSummary {
+  price: number;
+  ema9: number;
+  ema21: number;
+  ema50: number;
+  ema200: number;
+  emaAlignment: string;
+  rsi14: number;
+  rsiStatus: string;
+  atr14: number;
+  vwap: number;
+  vwapDeviationPct: number;
+  bollingerUpper: number;
+  bollingerMiddle: number;
+  bollingerLower: number;
+  bollingerBandwidthPct: number;
+  bollingerPercentB: number;
+  volumeMultiplier: number;
+}
+
+export interface MultiTimeframeSummary {
+  m5Flow: string;
+  m5Confidence: number;
+  h1Bias: string;
+  h4Bias: string;
+  macroBias: string;
+}
+
+export interface StrategyScoreSummary {
+  strategyId: string;
+  score: number;
+  triggered: boolean;
+  reason: string;
+}
+
+import type { AccountFinancialSnapshot } from "../execution/ledger";
+
+export type FinancialAccountingSummary = AccountFinancialSnapshot;
+
+export interface OpenPositionDetail {
+  id: string;
+  symbol: string;
+  direction: string;
+  strategy: string;
+  size: number;
+  entryPrice: number;
+  currentPrice: number;
+  stopLoss: number;
+  takeProfit: number;
+  riskUSD: number;
+  targetUSD: number;
+  unrealizedPnLUSD: number;
+  unrealizedPnLPct: number;
+  unrealizedR: number;
+  openedMinsAgo: number;
+}
+
 export interface BotContext {
   timestamp: string;
   symbol: string;
-  balance: {
-    opening: number;
-    current: number;
-    changePct: number;
+  chart: {
+    lastPrice: number;
+    recentCandles: CandleSummary[];
+    technicals: TechnicalsSummary;
+    multiTimeframe: MultiTimeframeSummary;
+    strategyScores: StrategyScoreSummary[];
   };
-  session: {
-    closedTrades: number;
-    wins: number;
-    losses: number;
-    totalR: number;
-    winRate: string;
-  };
-  openTrades: {
-    direction: string;
-    entryPrice: number;
-    stopLoss: number;
-    takeProfit: number;
+  financials: FinancialAccountingSummary;
+  openPositions: OpenPositionDetail[];
+  recentClosedTrades: {
+    id: string;
     strategy: string;
-    openedMinsAgo: number;
+    direction: string;
+    outcome: string;
+    entryPrice: number;
+    exitPrice: number;
+    realizedPnLUSD: number;
+    pnlR: number;
+    durationMin: number;
+    notes?: string;
   }[];
   lastSignal: {
     strategy: string;
@@ -49,20 +119,12 @@ export interface BotContext {
     sl: number;
     tp: number;
   } | null;
-  currentFlow: string;
-  recentTrades: {
-    strategy: string;
-    direction: string;
-    outcome: string;
-    pnlR: number;
-    durationMin: number;
-  }[];
 }
 
 // ── System prompt ───────────────────────────────────────────
-const SYSTEM_PROMPT = `You are an expert algorithmic trading analyst monitoring a live automated trading bot.
+const SYSTEM_PROMPT = `You are the Lead Quantitative Trading Analyst and Head Risk Accountant for an automated institutional trading bot.
 
-The bot trades BTC/USDT perpetual futures on Bybit using 5 strategies:
+The bot trades BTC/USDT perpetual futures on Bybit using 5 core quantitative strategies:
 1. TREND_PULLBACK_EMA — EMA confluence pullback in trending markets
 2. SR_FLIP_INVERSION — Support/Resistance flip retest
 3. BB_MEAN_REVERSION — Bollinger Band overextension fade (RSI confirmed)
@@ -71,15 +133,69 @@ The bot trades BTC/USDT perpetual futures on Bybit using 5 strategies:
 
 Risk management: 2R target, ATR-based stops, 1% account risk per trade, max 2 open trades.
 
-Your job:
-- Identify logical inconsistencies, risk issues, or strategy misfires
-- Flag when the bot is trading against macro bias
-- Warn about drawdown patterns or consecutive losses
-- Praise good setups when warranted
-- Be direct and concise, no fluff
-- Answer questions about what the bot is doing and why
+You have full real-time access to:
+1. LIVE CHART TELEMETRY: Latest OHLCV candle price action, EMAs (9, 21, 50, 200), intraday VWAP, RSI(14), ATR volatility, Bollinger Bands, and Higher Timeframe (H1/H4) trend bias.
+2. DOLLAR ACCOUNTING LEDGER: Exact Starting Capital, Total Equity, Cash/Free Margin, Locked Margin, Realized & Unrealized PnL ($), Win Rate, Profit Factor, Peak Equity, and Drawdowns.
+3. OPEN POSITIONS & RISK: Mark prices, floating PnL in exact dollars & R-multiples, distance to SL/TP, and duration.
+4. STRATEGY SCANNER: Live scores (0-100) and rationale for every strategy on the latest candle.
 
-Keep responses under 200 words. Plain text only, no markdown since this goes to Telegram.`;
+Your responsibilities:
+- Read and interpret the chart clearly when asked (price trends, support/resistance, momentum, candle patterns, VWAP stretches).
+- Account for every single dollar in the account with zero ambiguity.
+- Explain why trades opened, closed, or why the scanner is waiting for specific conditions.
+- Give crisp, highly professional, direct answers. Keep responses concise (under 250 words) and plain text (no markdown symbols like asterisks or hashtags since this is sent via Telegram).`;
+
+// ── Helper to format complete telemetry into prompt text ─────
+function formatContextForPrompt(ctx: BotContext): string {
+  const c = ctx.chart;
+  const f = ctx.financials;
+
+  const candlesText = c.recentCandles && c.recentCandles.length > 0
+    ? c.recentCandles.map((k) => `[${k.time}] O:${k.open} H:${k.high} L:${k.low} C:${k.close} (${k.type} ${k.changePct >= 0 ? "+" : ""}${k.changePct}%) Vol:${k.volume}`).join("\n")
+    : "No recent candle history available.";
+
+  const strategyScoresText = c.strategyScores && c.strategyScores.length > 0
+    ? c.strategyScores.map((s) => `• ${s.strategyId}: ${s.score}/100 [${s.triggered ? "TRIGGERED" : "WAITING"}] — ${s.reason}`).join("\n")
+    : "No scanner data.";
+
+  const openPosText = ctx.openPositions && ctx.openPositions.length > 0
+    ? ctx.openPositions.map((p) => `• ${p.direction} ${p.symbol} @ $${p.entryPrice} | Mark: $${p.currentPrice} | SL: $${p.stopLoss} | TP: $${p.takeProfit} | Floating PnL: ${p.unrealizedPnLUSD >= 0 ? "+" : ""}$${p.unrealizedPnLUSD} (${p.unrealizedR >= 0 ? "+" : ""}${p.unrealizedR}R / ${p.unrealizedPnLPct}%) | Risk: $${p.riskUSD} | Target: $${p.targetUSD} | Age: ${p.openedMinsAgo}m | Strat: ${p.strategy}`).join("\n")
+    : "None (0 open positions).";
+
+  const recentTradesText = ctx.recentClosedTrades && ctx.recentClosedTrades.length > 0
+    ? ctx.recentClosedTrades.map((t) => `• ${t.strategy} ${t.direction} → ${t.outcome} | Net PnL: ${t.realizedPnLUSD >= 0 ? "+" : ""}$${t.realizedPnLUSD} (${t.pnlR}R) | Exit: $${t.exitPrice} | Duration: ${t.durationMin}m`).join("\n")
+    : "No closed trades recorded yet.";
+
+  return `
+=== LIVE MARKET & CHART TELEMETRY ===
+Symbol: ${ctx.symbol} | Current Price: $${c.lastPrice}
+Multi-Timeframe Structure: M5 Flow=${c.multiTimeframe.m5Flow} (Conf: ${(c.multiTimeframe.m5Confidence * 100).toFixed(0)}%) | H1 Bias=${c.multiTimeframe.h1Bias} | H4 Macro=${c.multiTimeframe.macroBias}
+Indicators (M5):
+  • EMAs: 9=$${c.technicals.ema9} | 21=$${c.technicals.ema21} | 50=$${c.technicals.ema50} | 200=$${c.technicals.ema200} [${c.technicals.emaAlignment}]
+  • VWAP: $${c.technicals.vwap} (Deviation: ${c.technicals.vwapDeviationPct}%)
+  • RSI(14): ${c.technicals.rsi14} [${c.technicals.rsiStatus}] | ATR(14): $${c.technicals.atr14} | Vol Mult: ${c.technicals.volumeMultiplier}x
+  • Bollinger Bands: Upper=$${c.technicals.bollingerUpper} | Mid=$${c.technicals.bollingerMiddle} | Lower=$${c.technicals.bollingerLower} | %B=${c.technicals.bollingerPercentB} | Bandwidth=${c.technicals.bollingerBandwidthPct}%
+
+Recent M5 Price Action (Last ${c.recentCandles.length} bars):
+${candlesText}
+
+Strategy Scanner Status:
+${strategyScoresText}
+
+=== COMPLETE DOLLAR FINANCIAL LEDGER ===
+Starting Capital: $${f.startingBalanceUSD} | Total Equity: $${f.totalEquityUSD} | Cash / Free Margin: $${f.cashBalanceUSD}
+Locked Margin in Positions: $${f.lockedMarginUSD}
+Realized PnL: ${f.totalRealizedPnLUSD >= 0 ? "+" : ""}$${f.totalRealizedPnLUSD} | Floating Unrealized PnL: ${f.totalUnrealizedPnLUSD >= 0 ? "+" : ""}$${f.totalUnrealizedPnLUSD}
+Performance: WinRate=${f.winRatePct}% (${f.winningTrades}W / ${f.losingTrades}L / ${f.breakevenTrades}BE) | Profit Factor=${f.profitFactor} | Expectancy: $${f.expectancyUSD}/trade
+Risk & Drawdown: Peak Equity=$${f.peakEquityUSD} | Current Drawdown=$${f.currentDrawdownUSD} (${f.currentDrawdownPct}%) | Max DD=${f.maxDrawdownPct}%
+
+=== OPEN POSITIONS (${ctx.openPositions.length}) ===
+${openPosText}
+
+=== RECENT CLOSED TRADES ===
+${recentTradesText}
+`.trim();
+}
 
 // ── Message type ────────────────────────────────────────────
 interface ChatMessage {
@@ -161,7 +277,6 @@ export class GeminiAnalyst {
   private apiKey: string;
   private enabled: boolean;
   private chatHistory: ChatMessage[] = [];
-  private tradeHistory: BotContext["recentTrades"] = [];
 
   constructor() {
     this.apiKey = process.env.NVIDIA_API_KEY ?? "";
@@ -170,7 +285,7 @@ export class GeminiAnalyst {
     if (!this.enabled) {
       console.warn("[Analyst] NVIDIA_API_KEY missing — analyst disabled");
     } else {
-      console.log(`[Analyst] Kimi K3 via NVIDIA NIM initialised`);
+      console.log(`[Analyst] Kimi K3 via NVIDIA NIM initialised with Chart & Ledger access`);
     }
   }
 
@@ -185,18 +300,23 @@ export class GeminiAnalyst {
   async analyzeTradeOpen(trade: any, signal: any, context: BotContext): Promise<string | null> {
     if (!this.enabled) return null;
 
+    const formattedContext = formatContextForPrompt(context);
+
     return await this.generate([
       { role: "system", content: SYSTEM_PROMPT },
       {
         role: "user",
-        content: `New trade opened. Analyze and flag concerns.
+        content: `New trade opened on ${context.symbol}. Analyze the setup quality, chart alignment, and dollar risk.
 
-Context: ${JSON.stringify(context)}
+${formattedContext}
 
-Trade: ${trade.strategyId} ${trade.direction} @ ${trade.entryPrice}
-SL: ${trade.stopLoss} | TP: ${trade.takeProfit}
-Flow: ${signal.flow.flow} | Macro: ${signal.flow.macroBias}
-RSI: ${signal.indicators.rsi14.toFixed(1)} | VWAP dev: ${signal.indicators.vwap.deviationPct.toFixed(3)}% | Vol: ${signal.indicators.volumeMultiplier.toFixed(2)}x`,
+Trade Details:
+Strategy: ${trade.strategyId}
+Direction: ${trade.direction} @ $${trade.entryPrice}
+Stop Loss: $${trade.stopLoss} | Take Profit: $${trade.takeProfit}
+Position Size: ${trade.size}
+Flow: ${signal.flow.flow} | Macro Bias: ${signal.flow.macroBias}
+RSI: ${signal.indicators.rsi14.toFixed(1)} | VWAP Dev: ${signal.indicators.vwap.deviationPct.toFixed(3)}% | Vol Multiplier: ${signal.indicators.volumeMultiplier.toFixed(2)}x`,
       },
     ]);
   }
@@ -208,28 +328,21 @@ RSI: ${signal.indicators.rsi14.toFixed(1)} | VWAP dev: ${signal.indicators.vwap.
   async analyzeTradeClose(trade: any, context: BotContext): Promise<string | null> {
     if (!this.enabled) return null;
 
-    this.tradeHistory.push({
-      strategy: trade.strategyId,
-      direction: trade.direction,
-      outcome: trade.outcome,
-      pnlR: trade.pnlR ?? 0,
-      durationMin: Math.round((trade.durationMs ?? 0) / 60000),
-    });
-    if (this.tradeHistory.length > 10) this.tradeHistory = this.tradeHistory.slice(-10);
+    const formattedContext = formatContextForPrompt(context);
 
     return await this.generate([
       { role: "system", content: SYSTEM_PROMPT },
       {
         role: "user",
-        content: `Trade closed. Review result and pattern.
+        content: `Trade closed on ${context.symbol}. Review outcome, execution, and dollar impact on the ledger.
 
-Context: ${JSON.stringify(context)}
+${formattedContext}
 
-Closed: ${trade.strategyId} ${trade.direction} → ${trade.outcome}
-PnL: ${(trade.pnlR ?? 0).toFixed(2)}R (${(trade.pnlRaw ?? 0).toFixed(2)} USDT) | Duration: ${Math.round((trade.durationMs ?? 0) / 60000)}m
-
-Recent history:
-${this.tradeHistory.map((t, i) => `${i + 1}. ${t.strategy} ${t.direction} → ${t.outcome} (${t.pnlR.toFixed(2)}R)`).join("\n")}`,
+Closed Trade Details:
+Strategy: ${trade.strategyId} | Direction: ${trade.direction} → Outcome: ${trade.outcome}
+Entry: $${trade.entryPrice} | Exit: $${trade.exitPrice}
+Net PnL: $${(trade.pnlRaw ?? 0).toFixed(2)} (${(trade.pnlR ?? 0).toFixed(2)}R)
+Duration: ${Math.round((trade.durationMs ?? 0) / 60000)} minutes`,
       },
     ]);
   }
@@ -241,13 +354,17 @@ ${this.tradeHistory.map((t, i) => `${i + 1}. ${t.strategy} ${t.direction} → ${
   async analyzeDailySummary(context: BotContext): Promise<string | null> {
     if (!this.enabled) return null;
 
+    const formattedContext = formatContextForPrompt(context);
+
     return await this.generate([
       { role: "system", content: SYSTEM_PROMPT },
       {
         role: "user",
-        content: `End of day review. Context: ${JSON.stringify(context)}
+        content: `End of day comprehensive review.
 
-Cover: performance, strategy breakdown, risk concerns, one recommendation. Under 150 words.`,
+${formattedContext}
+
+Summarize today's performance, audit every dollar gained/lost, evaluate current market structure, assess open positions, and provide one key recommendation. Keep under 180 words.`,
       },
     ]);
   }
@@ -259,12 +376,14 @@ Cover: performance, strategy breakdown, risk concerns, one recommendation. Under
   async chat(userMessage: string, context: BotContext): Promise<string> {
     if (!this.enabled) return "AI analyst is not configured. Add NVIDIA_API_KEY to Railway variables.";
 
+    const formattedContext = formatContextForPrompt(context);
+
     const messages: ChatMessage[] = [
       { role: "system", content: SYSTEM_PROMPT },
       ...this.chatHistory,
       {
         role: "user",
-        content: `Bot state: ${JSON.stringify(context)}\n\nUser: ${userMessage}`,
+        content: `${formattedContext}\n\nUSER QUESTION: ${userMessage}`,
       },
     ];
 

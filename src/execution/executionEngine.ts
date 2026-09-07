@@ -26,6 +26,7 @@ import {
   Candle,
 } from "../types";
 import { BotLogger } from "../logger";
+import { TradeLedger } from "./ledger";
 
 // ── Internal state ─────────────────────────────────────────
 interface ExecutionState {
@@ -47,6 +48,7 @@ export class ExecutionEngine {
   private config: BotConfig;
   private state: ExecutionState;
   private logger: BotLogger;
+  private ledger: TradeLedger;
 
   public onTradeUpdate: ((trade: Trade) => void) | null = null;
 
@@ -54,6 +56,7 @@ export class ExecutionEngine {
     this.exchange = exchange;
     this.config = config;
     this.logger = logger;
+    this.ledger = new TradeLedger();
     this.state = {
       lastOrderCandleTs: 0,
       openTrades: new Map(),
@@ -165,6 +168,7 @@ export class ExecutionEngine {
     };
 
     this.state.openTrades.set(trade.id, trade);
+    this.ledger.recordOpen(trade, entry);
     this.onTradeUpdate?.(trade);
 
     this.logger.info("[Engine] Trade OPENED", {
@@ -185,6 +189,8 @@ export class ExecutionEngine {
   // ──────────────────────────────────────────────────────────
 
   checkOpenTrades(latestCandle: Candle): void {
+    this.ledger.updateMarkPrice(latestCandle.close);
+
     for (const [, trade] of this.state.openTrades) {
       const { high, low } = latestCandle;
 
@@ -261,7 +267,12 @@ export class ExecutionEngine {
   async initBalance(): Promise<void> {
     const balance = await this.fetchBalance();
     this.snapshotDayStart(balance);
+    this.ledger.initCapital(balance);
     this.logger.info("[Engine] Opening balance initialised", { balance });
+  }
+
+  getLedger(): TradeLedger {
+    return this.ledger;
   }
 
   getDayStartBalance(): number {
@@ -413,6 +424,7 @@ export class ExecutionEngine {
 
     this.state.openTrades.delete(trade.id);
     this.state.closedTrades.push(closed);
+    this.ledger.recordClose(closed);
     this.onTradeUpdate?.(closed);
 
     this.logger.info("[Engine] Trade CLOSED", {
