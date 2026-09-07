@@ -478,50 +478,27 @@ export class ExecutionEngine {
     };
 
     try {
-      // ── Entry market order ────────────────────────────
+      // ── Entry market order with SL/TP attached ────────
+      // Bybit futures requires SL and TP to be set on the
+      // entry order directly, not as separate orders.
       const entryResp = await this.exchange.createOrder(
         signal.symbol,
         "market",
         side,
-        size
+        size,
+        undefined,
+        {
+          stopLoss: sl,
+          takeProfit: tp,
+          slTriggerBy: "LastPrice",
+          tpTriggerBy: "LastPrice",
+        }
       );
       order.exchangeOrderId = entryResp.id;
-      order.status = OrderStatus.OPEN;
+      order.status = OrderStatus.FILLED;
       order.filledAt = Date.now();
 
-      // ── Stop-loss order ───────────────────────────────
-      await this.exchange.createOrder(
-        signal.symbol,
-        "stop_market" as any,
-        slSide,
-        size,
-        sl,
-        {
-          stopPrice: sl,
-          reduceOnly: true,
-          // triggerDirection: 2 = below (for LONG SL), 1 = above (for SHORT SL)
-          triggerDirection: side === "buy" ? 2 : 1,
-        }
-      );
-
-      // ── Take-profit order ─────────────────────────────
-      await this.exchange.createOrder(
-        signal.symbol,
-        "take_profit_market" as any,
-        slSide,
-        size,
-        tp,
-        {
-          stopPrice: tp,
-          reduceOnly: true,
-          // triggerDirection: 1 = above (for LONG TP), 2 = below (for SHORT TP)
-          triggerDirection: side === "buy" ? 1 : 2,
-        }
-      );
-
-      order.status = OrderStatus.FILLED;
-
-      this.logger.info("[Engine] Live orders placed", {
+      this.logger.info("[Engine] Live order placed", {
         entryOrderId: entryResp.id,
         sl,
         tp,
