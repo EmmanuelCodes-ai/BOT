@@ -549,7 +549,6 @@ class TradingBot {
           }
         : null,
       currentFlow: "UNKNOWN",
-      currentIndicators: null,
       recentTrades: closed.slice(-5).map((t) => ({
         strategy: t.strategyId,
         direction: t.direction,
