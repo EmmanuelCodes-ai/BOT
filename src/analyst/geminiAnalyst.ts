@@ -117,10 +117,11 @@ function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
+          console.log("[Analyst] NIM raw response:", JSON.stringify(parsed).slice(0, 300));
           const text = parsed?.choices?.[0]?.message?.content ?? "";
           resolve(text.trim());
         } catch {
-          reject(new Error(`Failed to parse NIM response: ${data.slice(0, 200)}`));
+          reject(new Error(`Failed to parse NIM response: ${data.slice(0, 300)}`));
         }
       });
     });
