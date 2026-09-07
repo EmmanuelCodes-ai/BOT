@@ -32,6 +32,8 @@ import { BotLogger } from "./logger";
 import { buildStrategyRegistry } from "./strategies";
 import { startHealthServer, registerTestSummaryCallback } from "./healthCheck";
 import { TelegramNotifier } from "./notifications";
+import { TelegramPoller } from "./notifications/telegramPoller";
+import { GeminiAnalyst, BotContext } from "./analyst";
 import { v4 as uuidv4 } from "uuid";
 
 // ============================================================
@@ -179,9 +181,12 @@ class TradingBot {
   private engine: ExecutionEngine;
   private logger: BotLogger;
   private telegram: TelegramNotifier;
+  private analyst: GeminiAnalyst;
+  private poller: TelegramPoller | null = null;
+  private lastSignal: any = null; // stored for Gemini context
 
   private lastProcessedCandleTs: number = 0;
-  private dailySummaryFiredDate: string = ""; // YYYY-MM-DD in WAT
+  private dailySummaryFiredDate: string = "";
   private running: boolean = false;
 
   constructor(
@@ -190,7 +195,8 @@ class TradingBot {
     classifier: FlowClassifier,
     engine: ExecutionEngine,
     logger: BotLogger,
-    telegram: TelegramNotifier
+    telegram: TelegramNotifier,
+    analyst: GeminiAnalyst
   ) {
     this.config = config;
     this.exchange = exchange;
@@ -198,8 +204,9 @@ class TradingBot {
     this.engine = engine;
     this.logger = logger;
     this.telegram = telegram;
+    this.analyst = analyst;
 
-    // Wire trade events to logger + telegram
+    // Wire trade events to logger + telegram + gemini
     this.engine.onTradeUpdate = (trade) => {
       this.logger.logTrade(trade);
 
@@ -219,6 +226,16 @@ class TradingBot {
           flow: trade.flow.flow,
           score,
         });
+
+        // Gemini proactive analysis on trade open
+        if (this.lastSignal && this.analyst.isEnabled()) {
+          const ctx = this.buildContext();
+          this.analyst.analyzeTradeOpen(trade, this.lastSignal, ctx).then((insight) => {
+            if (insight) {
+              this.telegram.notifyError(`🤖 AI Analyst:\n\n${insight}`);
+            }
+          }).catch(() => {});
+        }
       } else {
         this.telegram.notifyTradeClose({
           id: trade.id,
@@ -229,6 +246,16 @@ class TradingBot {
           strategy: trade.strategyId,
           durationMin: Math.round((trade.durationMs ?? 0) / 60000),
         });
+
+        // Gemini proactive analysis on trade close
+        if (this.analyst.isEnabled()) {
+          const ctx = this.buildContext();
+          this.analyst.analyzeTradeClose(trade, ctx).then((insight) => {
+            if (insight) {
+              this.telegram.notifyError(`🤖 AI Analyst:\n\n${insight}`);
+            }
+          }).catch(() => {});
+        }
       }
     };
   }
@@ -249,6 +276,20 @@ class TradingBot {
 
     // Register test summary endpoint
     registerTestSummaryCallback(() => this.fireDailySummary(true));
+
+    // Start Telegram message poller for chat with Gemini
+    const token = process.env.TELEGRAM_TOKEN ?? "";
+    const chatId = process.env.TELEGRAM_CHAT_ID ?? "";
+    if (token && chatId && this.analyst.isEnabled()) {
+      this.poller = new TelegramPoller(token, chatId);
+      this.poller.setMessageHandler(async (id, text, fromName) => {
+        this.logger.info(`[Chat] Message from ${fromName}: ${text}`);
+        const ctx = this.buildContext();
+        const reply = await this.analyst.chat(text, ctx);
+        await this.poller!.sendMessage(id, `🤖 AI Analyst:\n\n${reply}`);
+      });
+      this.poller.start();
+    }
 
     process.on("SIGINT", () => this.shutdown("SIGINT"));
     process.on("SIGTERM", () => this.shutdown("SIGTERM"));
@@ -355,6 +396,7 @@ class TradingBot {
 
     // ── Execute signal if present ──────────────────────────
     if (output.signal) {
+      this.lastSignal = output.signal; // store for Gemini context
       this.logger.logSignal(output.signal);
 
       const trade = await this.engine.execute(
@@ -437,6 +479,16 @@ class TradingBot {
       openTrades: openTrades.length,
       totalR,
     });
+
+    // Gemini daily analysis
+    if (this.analyst.isEnabled()) {
+      const ctx = this.buildContext();
+      this.analyst.analyzeDailySummary(ctx).then((insight) => {
+        if (insight) {
+          this.telegram.notifyError(`🤖 AI Daily Analysis:\n\n${insight}`);
+        }
+      }).catch(() => {});
+    }
   }
 
   private sendOpenPositionsNote(summary: string): void {
@@ -447,9 +499,66 @@ class TradingBot {
     );
   }
 
-  // ──────────────────────────────────────────────────────────
-  // Helpers
-  // ──────────────────────────────────────────────────────────
+  private buildContext(): BotContext {
+    const closed = this.engine.getClosedTrades();
+    const open = this.engine.getOpenTrades();
+    const opening = this.engine.getDayStartBalance();
+    const current = this.engine.getCurrentBalance();
+
+    return {
+      timestamp: new Date().toISOString(),
+      symbol: this.config.symbol,
+      balance: {
+        opening,
+        current,
+        changePct: opening > 0
+          ? parseFloat(((current - opening) / opening * 100).toFixed(2))
+          : 0,
+      },
+      session: {
+        closedTrades: closed.length,
+        wins: closed.filter((t) => t.outcome === "WIN").length,
+        losses: closed.filter((t) => t.outcome === "LOSS").length,
+        totalR: parseFloat(closed.reduce((s, t) => s + (t.pnlR ?? 0), 0).toFixed(2)),
+        winRate: closed.length > 0
+          ? ((closed.filter((t) => t.outcome === "WIN").length / closed.length) * 100).toFixed(1)
+          : "0",
+      },
+      openTrades: open.map((t) => ({
+        direction: t.direction,
+        entryPrice: t.entryPrice,
+        stopLoss: t.stopLoss,
+        takeProfit: t.takeProfit,
+        strategy: t.strategyId,
+        openedMinsAgo: Math.round((Date.now() - t.openedAt) / 60000),
+      })),
+      lastSignal: this.lastSignal
+        ? {
+            strategy: this.lastSignal.strategyId,
+            direction: this.lastSignal.direction,
+            score: this.lastSignal.allScores?.find((s: any) => s.strategyId === this.lastSignal.strategyId)?.score ?? 0,
+            flow: this.lastSignal.flow.flow,
+            macroBias: this.lastSignal.flow.macroBias,
+            rsi: this.lastSignal.indicators.rsi14,
+            atr: this.lastSignal.indicators.atr14,
+            vwapDevPct: this.lastSignal.indicators.vwap.deviationPct,
+            volumeMultiplier: this.lastSignal.indicators.volumeMultiplier,
+            entry: this.lastSignal.entryPrice,
+            sl: this.lastSignal.stopLoss,
+            tp: this.lastSignal.takeProfit,
+          }
+        : null,
+      currentFlow: "UNKNOWN",
+      currentIndicators: null,
+      recentTrades: closed.slice(-5).map((t) => ({
+        strategy: t.strategyId,
+        direction: t.direction,
+        outcome: t.outcome,
+        pnlR: t.pnlR ?? 0,
+        durationMin: Math.round((t.durationMs ?? 0) / 60000),
+      })),
+    };
+  }
 
   private async fetchLastPrice(): Promise<number> {
     try {
@@ -520,8 +629,9 @@ async function main(): Promise<void> {
   await engine.initBalance();
 
   const telegram = new TelegramNotifier();
+  const analyst = new GeminiAnalyst();
 
-  const bot = new TradingBot(config, exchange, classifier, engine, logger, telegram);
+  const bot = new TradingBot(config, exchange, classifier, engine, logger, telegram, analyst);
   await bot.start();
 }
 
