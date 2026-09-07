@@ -49,6 +49,11 @@ export class ExecutionEngine {
   private state: ExecutionState;
   private logger: BotLogger;
   private ledger: TradeLedger;
+  private latestBalanceInfo: { equity: number; walletBalance: number; availableBalance: number } = {
+    equity: 0,
+    walletBalance: 0,
+    availableBalance: 0,
+  };
 
   public onTradeUpdate: ((trade: Trade) => void) | null = null;
 
@@ -525,54 +530,74 @@ export class ExecutionEngine {
   }
 
   // ──────────────────────────────────────────────────────────
-  // Private: balance fetching
+  // Public / Private: balance fetching
   // ──────────────────────────────────────────────────────────
 
-  private async fetchBalance(): Promise<number> {
+  async fetchLiveAccountBalance(): Promise<{
+    equity: number;
+    walletBalance: number;
+    availableBalance: number;
+  }> {
     if (this.config.paperTrading) {
-      const balance = this.config.paperBalance;
-      this.snapshotDayStart(balance);
-      return balance;
+      const pnl = this.state.closedTrades.reduce((s, t) => s + (t.pnlRaw ?? 0), 0);
+      const base = this.state.dayStartBalance > 0 ? this.state.dayStartBalance : this.config.paperBalance;
+      const current = parseFloat((base + pnl).toFixed(4));
+      const res = { equity: current, walletBalance: current, availableBalance: current };
+      this.latestBalanceInfo = res;
+      this.snapshotDayStart(current);
+      return res;
     }
 
     try {
-      // Bybit Unified Trading Account requires accountType=UNIFIED
       const balances = await this.exchange.fetchBalance({ type: "unified" });
       const quote = this.config.symbol.split("/")[1]?.split(":")[0] ?? "USDT";
 
-      this.logger.debug("[Engine] Raw balance response", {
-        total: balances?.total,
-        free: balances?.free,
-      });
+      const infoList = (balances as any)?.info?.result?.list;
+      const uAccount = Array.isArray(infoList) ? infoList[0] : null;
 
-      // Try multiple balance fields Bybit may return
-      const total = (balances?.total as unknown as Record<string, number | undefined>)?.[quote];
-      const free = (balances?.free as unknown as Record<string, number | undefined>)?.[quote];
-      const balance = total ?? free ?? 0;
+      const totalEquity = uAccount?.totalEquity ? parseFloat(uAccount.totalEquity) : 0;
+      const totalWallet = uAccount?.totalWalletBalance ? parseFloat(uAccount.totalWalletBalance) : 0;
+      const totalAvail = uAccount?.totalAvailableBalance ? parseFloat(uAccount.totalAvailableBalance) : 0;
 
-      if (balance === 0) {
-        // Fallback: try USDT directly from info object
-        const info = (balances as any)?.info?.result?.list;
-        if (Array.isArray(info)) {
-          for (const account of info) {
-            if (account?.accountType === "UNIFIED") {
-              const coin = account?.coin?.find((c: any) => c?.coin === quote);
-              if (coin) {
-                const walletBalance = parseFloat(coin.walletBalance ?? "0");
-                this.snapshotDayStart(walletBalance);
-                return walletBalance;
-              }
-            }
-          }
-        }
-      }
+      const coinObj = uAccount?.coin?.find((c: any) => c?.coin === quote);
+      const coinWallet = coinObj?.walletBalance ? parseFloat(coinObj.walletBalance) : 0;
+      const coinEquity = coinObj?.equity ? parseFloat(coinObj.equity) : 0;
 
-      this.snapshotDayStart(balance);
-      return balance;
+      const ccxtTotal = (balances?.total as unknown as Record<string, number | undefined>)?.[quote] ?? 0;
+      const ccxtFree = (balances?.free as unknown as Record<string, number | undefined>)?.[quote] ?? 0;
+
+      const finalEquity = totalEquity > 0 ? totalEquity : (coinEquity > 0 ? coinEquity : (ccxtTotal > 0 ? ccxtTotal : coinWallet));
+      const finalWallet = totalWallet > 0 ? totalWallet : (coinWallet > 0 ? coinWallet : (ccxtTotal > 0 ? ccxtTotal : finalEquity));
+      const finalAvail = totalAvail > 0 ? totalAvail : (ccxtFree > 0 ? ccxtFree : finalWallet);
+
+      const res = {
+        equity: parseFloat(finalEquity.toFixed(4)),
+        walletBalance: parseFloat(finalWallet.toFixed(4)),
+        availableBalance: parseFloat(finalAvail.toFixed(4)),
+      };
+
+      this.latestBalanceInfo = res;
+      this.snapshotDayStart(res.equity > 0 ? res.equity : res.walletBalance);
+      return res;
     } catch (err) {
-      this.logger.error("[Engine] fetchBalance failed", { error: String(err) });
-      return 0;
+      this.logger.error("[Engine] fetchLiveAccountBalance failed", { error: String(err) });
+      return this.latestBalanceInfo;
     }
+  }
+
+  async fetchBalance(): Promise<number> {
+    const live = await this.fetchLiveAccountBalance();
+    return live.equity > 0 ? live.equity : live.walletBalance;
+  }
+
+  getLatestBalanceInfo(): { equity: number; walletBalance: number; availableBalance: number } {
+    if (this.latestBalanceInfo.equity === 0) {
+      const pnl = this.state.closedTrades.reduce((s, t) => s + (t.pnlRaw ?? 0), 0);
+      const base = this.state.dayStartBalance > 0 ? this.state.dayStartBalance : this.config.paperBalance;
+      const current = parseFloat((base + pnl).toFixed(4));
+      return { equity: current, walletBalance: current, availableBalance: current };
+    }
+    return this.latestBalanceInfo;
   }
 
   /**

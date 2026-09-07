@@ -519,7 +519,7 @@ class TradingBot {
 
   private buildContext(): BotContext {
     const ledger = this.engine.getLedger();
-    const financialSnap = ledger.getFinancialSnapshot(this.engine.getDayStartBalance());
+    const financialSnap = ledger.getFinancialSnapshot(this.engine.getLatestBalanceInfo());
     const openPositions = ledger.getOpenPositions();
     const closedTrades = ledger.getClosedTrades();
 

@@ -214,7 +214,11 @@ export class TradeLedger {
   }
 
   // ── Get financial snapshot ─────────────────────────────────
-  getFinancialSnapshot(liveBalance?: number): AccountFinancialSnapshot {
+  getFinancialSnapshot(live?: { equity: number; walletBalance: number; availableBalance: number } | number): AccountFinancialSnapshot {
+    const liveObj = typeof live === "number"
+      ? { equity: live, walletBalance: live, availableBalance: live }
+      : live;
+
     const realizedPnL = parseFloat(
       this.closedTrades.reduce((acc, t) => acc + t.realizedPnLUSD, 0).toFixed(4)
     );
@@ -226,10 +230,16 @@ export class TradeLedger {
 
     const starting = this.startingBalanceUSD > 0
       ? this.startingBalanceUSD
-      : (liveBalance ?? 10000);
+      : (liveObj?.walletBalance ?? liveObj?.equity ?? 10000);
 
-    const cashBalance = parseFloat((starting + realizedPnL).toFixed(4));
-    const totalEquity = parseFloat((cashBalance + unrealizedPnL).toFixed(4));
+    const totalEquity = liveObj && liveObj.equity > 0
+      ? parseFloat(liveObj.equity.toFixed(4))
+      : parseFloat((starting + realizedPnL + unrealizedPnL).toFixed(4));
+
+    const cashBalance = liveObj && liveObj.availableBalance > 0
+      ? parseFloat(liveObj.availableBalance.toFixed(4))
+      : parseFloat((starting + realizedPnL).toFixed(4));
+
     const lockedMargin = parseFloat(
       Array.from(this.openPositions.values())
         .reduce((acc, p) => acc + p.notionalUSD, 0)
