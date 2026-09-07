@@ -254,16 +254,34 @@ export class ExecutionEngine {
   }
 
   // ──────────────────────────────────────────────────────────
-  // Public: balance tracking
+  // Public: initialise balance snapshot on startup
+  // Call this once after the exchange is ready
   // ──────────────────────────────────────────────────────────
+
+  async initBalance(): Promise<void> {
+    const balance = await this.fetchBalance();
+    this.snapshotDayStart(balance);
+    this.logger.info("[Engine] Opening balance initialised", { balance });
+  }
 
   getDayStartBalance(): number {
     return this.state.dayStartBalance;
   }
 
   /**
-   * Returns the current balance: paper balance adjusted by
-   * all closed trade PnL accumulated today.
+   * Async version — fetches real balance from exchange when not paper trading.
+   * Use this for the daily summary to get accurate closing balance.
+   */
+  async getCurrentBalanceAsync(): Promise<number> {
+    if (this.config.paperTrading) {
+      return this.getCurrentBalance();
+    }
+    return await this.fetchBalance();
+  }
+
+  /**
+   * Sync version — paper balance adjusted by closed trade PnL.
+   * Used internally where async is not available.
    */
   getCurrentBalance(): number {
     const totalPnl = this.state.closedTrades.reduce(

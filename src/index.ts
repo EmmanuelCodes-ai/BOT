@@ -416,7 +416,7 @@ class TradingBot {
       totalPnl: parseFloat(totalPnl.toFixed(4)),
       winRate,
       openingBalance: this.engine.getDayStartBalance(),
-      closingBalance: this.engine.getCurrentBalance(),
+      closingBalance: await this.engine.getCurrentBalanceAsync(),
     });
 
     // Append open positions note
@@ -515,6 +515,10 @@ async function main(): Promise<void> {
   const strategies = buildStrategyRegistry();
   const classifier = new FlowClassifier(strategies);
   const engine = new ExecutionEngine(exchange, config, logger);
+
+  // Fetch and snapshot real opening balance immediately on startup
+  await engine.initBalance();
+
   const telegram = new TelegramNotifier();
 
   const bot = new TradingBot(config, exchange, classifier, engine, logger, telegram);
