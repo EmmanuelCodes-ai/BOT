@@ -13,6 +13,7 @@ import * as https from "https";
 
 const NIM_BASE_URL = "https://integrate.api.nvidia.com/v1";
 const MODEL = "deepseek-ai/deepseek-v4-pro-0813";
+const REQUEST_TIMEOUT_MS = 30000;
 
 // ── Bot context snapshot ────────────────────────────────────
 export interface BotContext {
@@ -127,6 +128,9 @@ function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
     });
 
     req.on("error", reject);
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      req.destroy(new Error(`NIM request timed out after ${REQUEST_TIMEOUT_MS}ms`));
+    });
     req.write(body);
     req.end();
   });
