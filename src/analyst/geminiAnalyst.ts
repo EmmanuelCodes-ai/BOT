@@ -12,7 +12,7 @@
 import * as https from "https";
 
 const NIM_BASE_URL = "https://integrate.api.nvidia.com/v1";
-const MODEL = "deepseek-ai/deepseek-v4-pro-0813";
+const MODEL = "meta/llama-3.1-8b-instruct";
 const REQUEST_TIMEOUT_MS = 30000;
 
 // ── Bot context snapshot ────────────────────────────────────
