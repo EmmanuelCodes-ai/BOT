@@ -228,7 +228,7 @@ Keep it under 150 words.`;
       // Start or reuse chat session
       if (!this.chatSession) {
         const model = this.genAI.getGenerativeModel({
-          model: "gemini-1.5-flash",
+          model: "gemini-2.0-flash",
           systemInstruction: SYSTEM_PROMPT,
         });
         this.chatSession = model.startChat();
@@ -256,7 +256,7 @@ User question: ${userMessage}`;
   private async generate(prompt: string): Promise<string | null> {
     try {
       const model = this.genAI.getGenerativeModel({
-        model: "gemini-1.5-flash",
+        model: "gemini-2.0-flash",
         systemInstruction: SYSTEM_PROMPT,
       });
 
