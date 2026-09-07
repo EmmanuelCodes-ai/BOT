@@ -93,9 +93,8 @@ function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
     const body = JSON.stringify({
       model: MODEL,
       messages,
-      max_tokens: 4096,
-      temperature: 1,
-      reasoning_effort: "max",
+      max_tokens: 2048,
+      temperature: 0.7,
       stream: true,
     });
 
@@ -146,10 +145,10 @@ function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
 
     req.on("error", reject);
 
-    // 60 second timeout
-    req.setTimeout(60000, () => {
+    // 120 second timeout
+    req.setTimeout(120000, () => {
       req.destroy();
-      reject(new Error("NIM request timed out after 60s"));
+      reject(new Error("NIM request timed out after 120s"));
     });
 
     req.write(body);
