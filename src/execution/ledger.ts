@@ -29,6 +29,7 @@ export interface PositionLedgerEntry {
   durationMinutes: number;
   partialRealizedUSD?: number;
   partialRealizedR?: number;
+  partialRealizedPct?: number;
   isBreakeven?: boolean;
 }
 
@@ -51,6 +52,7 @@ export interface ClosedTradeLedgerEntry {
   durationMinutes: number;
   partialRealizedUSD?: number;
   partialRealizedR?: number;
+  partialRealizedPct?: number;
   notes: string;
 }
 
@@ -208,6 +210,9 @@ export class TradeLedger {
       openedAt: trade.openedAt,
       closedAt,
       durationMinutes,
+      partialRealizedUSD: trade.partialPnlRaw,
+      partialRealizedR: trade.partialPnlR,
+      partialRealizedPct: trade.partialPnlPct,
       notes: trade.notes,
     };
 
@@ -225,7 +230,8 @@ export class TradeLedger {
     exitPrice: number,
     pnlUSD: number,
     pnlR: number,
-    newStopLoss: number
+    newStopLoss: number,
+    pnlPct?: number
   ): void {
     const pos = this.openPositions.get(trade.id);
     if (!pos) return;
@@ -235,6 +241,9 @@ export class TradeLedger {
     pos.isBreakeven = true;
     pos.partialRealizedUSD = parseFloat(((pos.partialRealizedUSD ?? 0) + pnlUSD).toFixed(4));
     pos.partialRealizedR = parseFloat(((pos.partialRealizedR ?? 0) + pnlR).toFixed(3));
+    if (pnlPct !== undefined) {
+      pos.partialRealizedPct = parseFloat(((pos.partialRealizedPct ?? 0) + pnlPct).toFixed(2));
+    }
 
     const stopDist = Math.abs(pos.entryPrice - pos.stopLoss);
     pos.riskUSD = parseFloat((stopDist * pos.size).toFixed(4));

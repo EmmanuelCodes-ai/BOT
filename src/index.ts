@@ -72,9 +72,15 @@ function loadConfig(): BotConfig {
     paperTrading: process.env.PAPER_TRADING !== "false",
     paperBalance: parseFloat(process.env.PAPER_BALANCE ?? "10000"),
     enableEarlyPartials: process.env.ENABLE_EARLY_PARTIALS !== "false",
-    partialTPR: parseFloat(process.env.PARTIAL_TP_R ?? "0.5"),
+    partialProfitPct: (() => {
+      const raw = parseFloat(process.env.PARTIAL_PROFIT_PCT ?? process.env.PARTIAL_TP_PCT ?? process.env.PARTIAL_TP_R ?? "0.005");
+      return raw >= 0.05 ? raw / 100 : raw; // accepts 0.5 (0.5%) or 0.005
+    })(),
     partialClosePct: parseFloat(process.env.PARTIAL_CLOSE_PCT ?? "0.5"),
-    breakevenBufferR: parseFloat(process.env.BREAKEVEN_BUFFER_R ?? "0.05"),
+    breakevenBufferPct: (() => {
+      const raw = parseFloat(process.env.BREAKEVEN_BUFFER_PCT ?? "0.0005");
+      return raw >= 0.01 ? raw / 100 : raw; // accepts 0.05 (0.05%) or 0.0005
+    })(),
   };
 }
 
@@ -267,6 +273,7 @@ class TradingBot {
           durationMin: Math.round((trade.durationMs ?? 0) / 60000),
           partialPnlRaw: trade.partialPnlRaw ?? undefined,
           partialPnlR: trade.partialPnlR ?? undefined,
+          partialPnlPct: trade.partialPnlPct ?? undefined,
         });
 
         // Gemini proactive analysis on trade close
@@ -282,22 +289,23 @@ class TradingBot {
     };
 
     // Wire early partial profit harvesting to telegram & AI analyst
-    this.engine.onPartialProfit = (trade, bankedRaw, bankedR, breakevenPrice) => {
+    this.engine.onPartialProfit = (trade, bankedRaw, profitPct, breakevenPrice) => {
       this.telegram.notifyPartialHarvest({
         id: trade.id,
         symbol: trade.symbol,
         direction: trade.direction,
         harvestPrice: trade.partialExitPrice ?? trade.entryPrice,
         bankedPnlRaw: bankedRaw,
-        bankedPnlR: bankedR,
+        profitPct,
         remainingSize: trade.size,
         breakevenPrice,
         strategy: trade.strategyId,
       });
 
       if (this.analyst.isEnabled()) {
+        const pctFormatted = `+${profitPct.toFixed(2)}%`;
         this.telegram.notifyAnalyst(
-          `🛡️ <b>Risk-Free Milestone Reached:</b> Early partial profit of +$${bankedRaw.toFixed(2)} (+${bankedR.toFixed(2)}R) secured on ${trade.symbol}. Stop Loss shifted to breakeven (${breakevenPrice}). Remaining position is now running 100% risk-free!`
+          `🛡️ <b>Risk-Free Milestone Reached:</b> Early partial profit of +$${bankedRaw.toFixed(2)} (${pctFormatted}) secured on ${trade.symbol}. Stop Loss shifted to breakeven (${breakevenPrice}). Remaining position is now running 100% risk-free!`
         );
       }
     };

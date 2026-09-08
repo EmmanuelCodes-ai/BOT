@@ -191,6 +191,7 @@ export interface Trade {
   partialSize?: number;
   partialPnlRaw?: number;
   partialPnlR?: number;
+  partialPnlPct?: number;     // percentage gain e.g. 0.5 for +0.5%
   isBreakeven: boolean;
   pnlRaw: number | null;      // raw PnL in quote currency
   pnlR: number | null;        // PnL expressed in R multiples
@@ -239,7 +240,9 @@ export interface BotConfig {
   paperTrading: boolean;
   paperBalance: number;       // virtual account size for paper trading sizing
   enableEarlyPartials: boolean;
-  partialTPR: number;          // e.g. 0.5 for +0.5R early take-profit
+  partialProfitPct: number;    // e.g. 0.005 for +0.5% price gain
+  partialTPR?: number;         // backwards-compatibility alias
   partialClosePct: number;     // e.g. 0.5 to close 50% size
-  breakevenBufferR: number;    // e.g. 0.05R to cover exchange fees
+  breakevenBufferPct: number;  // e.g. 0.0005 (0.05%) to cover exchange fees
+  breakevenBufferR?: number;   // backwards-compatibility alias
 }

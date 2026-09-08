@@ -107,7 +107,8 @@ export class TelegramNotifier {
     direction: string;
     harvestPrice: number;
     bankedPnlRaw: number;
-    bankedPnlR: number;
+    profitPct?: number;
+    bankedPnlR?: number;
     remainingSize: number;
     breakevenPrice: number;
     strategy: string;
@@ -115,12 +116,16 @@ export class TelegramNotifier {
     if (!this.enabled) return;
 
     const pnlSign = params.bankedPnlRaw >= 0 ? "+" : "";
+    const pctStr = params.profitPct !== undefined
+      ? `+${params.profitPct.toFixed(2)}%`
+      : (params.bankedPnlR !== undefined ? `${pnlSign}${params.bankedPnlR.toFixed(2)}R` : "");
+
     const msg =
-      `🎯 <b>EARLY PARTIAL PROFIT HARVESTED (${pnlSign}${params.bankedPnlR.toFixed(2)}R)</b>\n\n` +
+      `🎯 <b>EARLY PARTIAL PROFIT HARVESTED (${pctStr})</b>\n\n` +
       `Strategy     : ${params.strategy}\n` +
       `Symbol       : ${params.symbol} (${params.direction})\n` +
-      `Harvest Price: ${params.harvestPrice} (Market Fill)\n` +
-      `Banked Cash  : <b>${pnlSign}$${params.bankedPnlRaw.toFixed(4)}</b> (${pnlSign}${params.bankedPnlR.toFixed(2)}R)\n` +
+      `Harvest Price: ${params.harvestPrice} (${pctStr} Gain)\n` +
+      `Banked Cash  : <b>${pnlSign}$${params.bankedPnlRaw.toFixed(4)}</b> (${pctStr})\n` +
       `Remaining Pos: ${params.remainingSize}\n` +
       `🛡️ Stop Loss : <b>${params.breakevenPrice}</b> (Moved to Breakeven + Fee Buffer)\n\n` +
       `Status       : <b>100% RISK-FREE TRADE 🛡️</b>\n` +
@@ -140,6 +145,7 @@ export class TelegramNotifier {
     durationMin: number;
     partialPnlRaw?: number;
     partialPnlR?: number;
+    partialPnlPct?: number;
   }): void {
     if (!this.enabled) return;
 
@@ -155,7 +161,10 @@ export class TelegramNotifier {
 
     let partialInfo = "";
     if (params.partialPnlRaw !== undefined && params.partialPnlRaw > 0) {
-      partialInfo = `Partials Banked: +$${params.partialPnlRaw.toFixed(4)} (+${(params.partialPnlR ?? 0).toFixed(2)}R)\n`;
+      const pctStr = params.partialPnlPct !== undefined
+        ? ` (+${params.partialPnlPct.toFixed(2)}%)`
+        : (params.partialPnlR !== undefined ? ` (+${params.partialPnlR.toFixed(2)}R)` : "");
+      partialInfo = `Partials Banked: +$${params.partialPnlRaw.toFixed(4)}${pctStr}\n`;
     }
 
     const msg =
