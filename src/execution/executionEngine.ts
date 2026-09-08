@@ -207,14 +207,17 @@ export class ExecutionEngine {
     for (const [, trade] of this.state.openTrades) {
       if (trade.entryPrice <= 0) continue;
 
-      const currentGainFraction = trade.direction === SignalDirection.LONG
-        ? (currentPrice - trade.entryPrice) / trade.entryPrice
-        : (trade.entryPrice - currentPrice) / trade.entryPrice;
+      const rawPriceChangePct = trade.direction === SignalDirection.LONG
+        ? ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100
+        : ((trade.entryPrice - currentPrice) / trade.entryPrice) * 100;
 
-      // 1. Check aggressive early partial profit harvest (+0.5% default or configured partialProfitPct)
-      const targetGainFraction = this.config.partialProfitPct ?? 0.005;
-      if (this.config.enableEarlyPartials && !trade.partialTaken && currentGainFraction >= targetGainFraction) {
-        await this.harvestPartial(trade, currentPrice, currentGainFraction);
+      const leverage = (this.config.leverage && this.config.leverage > 0) ? this.config.leverage : 10;
+      const currentROI = rawPriceChangePct * leverage; // Bybit Position ROI %
+
+      // 1. Check aggressive early partial profit harvest (+0.5% Bybit Position ROI default)
+      const targetROI = this.config.partialProfitROIPct ?? 0.5;
+      if (this.config.enableEarlyPartials && !trade.partialTaken && currentROI >= targetROI) {
+        await this.harvestPartial(trade, currentPrice, currentROI, rawPriceChangePct);
       }
 
       // 2. Check full Stop Loss or Take Profit exit against live price
@@ -257,9 +260,13 @@ export class ExecutionEngine {
       const { high, low } = latestCandle;
       if (trade.entryPrice <= 0) continue;
 
-      // 1. Check early partial take-profit breached by candle high/low
+      // 1. Check early partial take-profit breached by candle high/low (+0.5% Bybit Position ROI)
       if (this.config.enableEarlyPartials && !trade.partialTaken) {
-        const targetGainFraction = this.config.partialProfitPct ?? 0.005;
+        const leverage = (this.config.leverage && this.config.leverage > 0) ? this.config.leverage : 10;
+        const targetROI = this.config.partialProfitROIPct ?? 0.5;
+        const targetPricePct = targetROI / leverage; // in percent e.g. 0.5 / 10 = 0.05%
+        const targetGainFraction = targetPricePct / 100; // in fraction e.g. 0.0005
+
         const isPartialHit =
           trade.direction === SignalDirection.LONG
             ? (high - trade.entryPrice) / trade.entryPrice >= targetGainFraction
@@ -270,7 +277,7 @@ export class ExecutionEngine {
             trade.direction === SignalDirection.LONG
               ? trade.entryPrice * (1 + targetGainFraction)
               : trade.entryPrice * (1 - targetGainFraction);
-          await this.harvestPartial(trade, harvestPrice, targetGainFraction);
+          await this.harvestPartial(trade, harvestPrice, targetROI, targetPricePct);
         }
       }
 
@@ -306,7 +313,7 @@ export class ExecutionEngine {
   // Private: harvest early partial profit & move SL to breakeven
   // ──────────────────────────────────────────────────────────
 
-  async harvestPartial(trade: Trade, currentPrice: number, gainFraction: number): Promise<void> {
+  async harvestPartial(trade: Trade, currentPrice: number, currentROI: number, rawPricePct: number): Promise<void> {
     try {
       const closePct = this.config.partialClosePct ?? 0.5;
       const rawCloseSize = trade.size * closePct;
@@ -319,8 +326,8 @@ export class ExecutionEngine {
         closeSize = parseFloat((trade.size * 0.5).toFixed(8));
       }
 
-      const gainPct = gainFraction * 100; // e.g. 0.50%
-      const gainPctFormatted = `+${gainPct.toFixed(2)}%`;
+      const roiFormatted = `+${currentROI.toFixed(2)}% ROI`;
+      const pricePctFormatted = `+${rawPricePct.toFixed(3)}%`;
 
       // If live trading on Bybit, place reduce-only market order
       const hasApiKey = Boolean(this.exchange.apiKey && this.exchange.apiKey.trim().length > 5);
@@ -331,7 +338,7 @@ export class ExecutionEngine {
             symbol: trade.symbol,
             side,
             size: closeSize,
-            triggerPct: gainPctFormatted,
+            triggerROI: roiFormatted,
           });
           const resp = await this.exchange.createOrder(
             trade.symbol,
@@ -398,36 +405,37 @@ export class ExecutionEngine {
       trade.partialSize = closeSize;
       trade.partialPnlRaw = parseFloat(bankedRaw.toFixed(4));
       trade.partialPnlR = parseFloat(bankedR.toFixed(3));
-      trade.partialPnlPct = parseFloat(gainPct.toFixed(2));
+      trade.partialPnlPct = parseFloat(currentROI.toFixed(2));
       trade.size = parseFloat((trade.size - closeSize).toFixed(8));
       trade.stopLoss = bePrice;
       trade.order.stopLoss = bePrice;
       trade.isBreakeven = true;
 
       // Record in ledger
-      this.ledger.recordPartialClose(trade, closeSize, currentPrice, bankedRaw, bankedR, bePrice, parseFloat(gainPct.toFixed(2)));
+      this.ledger.recordPartialClose(trade, closeSize, currentPrice, bankedRaw, bankedR, bePrice, parseFloat(currentROI.toFixed(2)));
 
       this.logger.info("🎯 [Engine] EARLY PARTIAL HARVESTED & SL SHIFTED TO BREAKEVEN", {
         id: trade.id.slice(0, 8),
         symbol: trade.symbol,
-        gainPct: gainPctFormatted,
+        roi: roiFormatted,
+        pricePct: pricePctFormatted,
         bankedUSD: bankedRaw.toFixed(4),
         newStopLoss: bePrice,
         remainingSize: trade.size,
       });
 
       console.log("\n═════════════════════════════════════════════════════");
-      console.log(`       🎯 EARLY PARTIAL PROFIT HARVESTED (${gainPctFormatted})      `);
+      console.log(`       🎯 EARLY PARTIAL PROFIT HARVESTED (${roiFormatted})      `);
       console.log("═════════════════════════════════════════════════════");
       console.log(`Symbol       : ${trade.symbol}`);
-      console.log(`Harvest Price: ${currentPrice} (${gainPctFormatted} Gain)`);
-      console.log(`Banked PnL   : +$${bankedRaw.toFixed(2)} (${gainPctFormatted})`);
+      console.log(`Harvest Price: ${currentPrice} (${roiFormatted} | ${pricePctFormatted} Price Move)`);
+      console.log(`Banked PnL   : +$${bankedRaw.toFixed(2)} (${roiFormatted})`);
       console.log(`Remaining Pos: ${trade.size}`);
       console.log(`New Stop Loss: ${bePrice} (Breakeven + Fee Buffer)`);
       console.log("Trade State  : 100% RISK-FREE 🛡️");
       console.log("═════════════════════════════════════════════════════\n");
 
-      this.onPartialProfit?.(trade, bankedRaw, gainPct, bePrice);
+      this.onPartialProfit?.(trade, bankedRaw, currentROI, bePrice);
     } catch (err) {
       this.logger.error("[Engine] Error in harvestPartial", { error: String(err) });
     }

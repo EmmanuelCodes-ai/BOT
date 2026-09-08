@@ -117,14 +117,14 @@ export class TelegramNotifier {
 
     const pnlSign = params.bankedPnlRaw >= 0 ? "+" : "";
     const pctStr = params.profitPct !== undefined
-      ? `+${params.profitPct.toFixed(2)}%`
+      ? `+${params.profitPct.toFixed(2)}% ROI`
       : (params.bankedPnlR !== undefined ? `${pnlSign}${params.bankedPnlR.toFixed(2)}R` : "");
 
     const msg =
       `🎯 <b>EARLY PARTIAL PROFIT HARVESTED (${pctStr})</b>\n\n` +
       `Strategy     : ${params.strategy}\n` +
       `Symbol       : ${params.symbol} (${params.direction})\n` +
-      `Harvest Price: ${params.harvestPrice} (${pctStr} Gain)\n` +
+      `Harvest Price: ${params.harvestPrice} (${pctStr})\n` +
       `Banked Cash  : <b>${pnlSign}$${params.bankedPnlRaw.toFixed(4)}</b> (${pctStr})\n` +
       `Remaining Pos: ${params.remainingSize}\n` +
       `🛡️ Stop Loss : <b>${params.breakevenPrice}</b> (Moved to Breakeven + Fee Buffer)\n\n` +

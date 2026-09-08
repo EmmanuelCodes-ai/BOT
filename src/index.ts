@@ -67,11 +67,13 @@ function loadConfig(): BotConfig {
     sessionEndUTC: parseInt(process.env.SESSION_END_UTC ?? "21", 10),
     h1Timeframe: "1h",
     h4Timeframe: "4h",
+    leverage: parseFloat(process.env.LEVERAGE ?? "10"),
     minVolumeMultiplier: parseFloat(process.env.MIN_VOLUME_MULTIPLIER ?? "0.8"),
     maxOpenTrades: parseInt(process.env.MAX_OPEN_TRADES ?? "2", 10),
     paperTrading: process.env.PAPER_TRADING !== "false",
     paperBalance: parseFloat(process.env.PAPER_BALANCE ?? "10000"),
     enableEarlyPartials: process.env.ENABLE_EARLY_PARTIALS !== "false",
+    partialProfitROIPct: parseFloat(process.env.PARTIAL_PROFIT_ROI_PCT ?? process.env.PARTIAL_PROFIT_PCT ?? "0.5"),
     partialProfitPct: (() => {
       const raw = parseFloat(process.env.PARTIAL_PROFIT_PCT ?? process.env.PARTIAL_TP_PCT ?? process.env.PARTIAL_TP_R ?? "0.005");
       return raw >= 0.05 ? raw / 100 : raw; // accepts 0.5 (0.5%) or 0.005
@@ -303,9 +305,9 @@ class TradingBot {
       });
 
       if (this.analyst.isEnabled()) {
-        const pctFormatted = `+${profitPct.toFixed(2)}%`;
+        const roiFormatted = `+${profitPct.toFixed(2)}% ROI`;
         this.telegram.notifyAnalyst(
-          `🛡️ <b>Risk-Free Milestone Reached:</b> Early partial profit of +$${bankedRaw.toFixed(2)} (${pctFormatted}) secured on ${trade.symbol}. Stop Loss shifted to breakeven (${breakevenPrice}). Remaining position is now running 100% risk-free!`
+          `🛡️ <b>Risk-Free Milestone Reached:</b> Early partial profit of +$${bankedRaw.toFixed(2)} (${roiFormatted}) secured on ${trade.symbol}. Stop Loss shifted to breakeven (${breakevenPrice}). Remaining position is now running 100% risk-free!`
         );
       }
     };

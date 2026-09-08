@@ -228,7 +228,8 @@ export interface EvaluationRecord {
 export interface BotConfig {
   symbol: string;
   timeframe: string;          // "5m"
-  riskPerTradePct: number;    // e.g. 0.01 = 1% of account
+  riskPerTradePct: number;    // e.g. 0.001 = 0.1% of account
+  leverage: number;           // e.g. 10 for 10x leverage
   riskRewardRatio: number;    // 2
   atrMultiplierSL: number;    // e.g. 1.5 × ATR for stop distance
   sessionStartUTC: number;    // 13 (13:00 UTC)
@@ -240,7 +241,8 @@ export interface BotConfig {
   paperTrading: boolean;
   paperBalance: number;       // virtual account size for paper trading sizing
   enableEarlyPartials: boolean;
-  partialProfitPct: number;    // e.g. 0.005 for +0.5% price gain
+  partialProfitROIPct: number; // e.g. 0.5 for +0.5% Bybit position ROI
+  partialProfitPct: number;    // raw price gain fraction
   partialTPR?: number;         // backwards-compatibility alias
   partialClosePct: number;     // e.g. 0.5 to close 50% size
   breakevenBufferPct: number;  // e.g. 0.0005 (0.05%) to cover exchange fees
