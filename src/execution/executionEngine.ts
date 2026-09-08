@@ -543,7 +543,7 @@ export class ExecutionEngine {
       order.stopLoss = actualStopLoss;
       order.takeProfit = actualTakeProfit;
 
-      // Query Bybit for Tran ID (Trade History) and TP/SL IDs (Current Orders)
+      // Query Bybit for TP/SL IDs (Current Orders)
       try {
         const openOrders: any[] = await this.exchange.fetchOpenOrders(signal.symbol);
         for (const o of openOrders) {
@@ -557,15 +557,6 @@ export class ExecutionEngine {
         if (!order.bybitTpId && !order.bybitSlId && openOrders.length > 0) {
           const ids = openOrders.map((o) => (o.id ?? "").slice(-8));
           if (ids[0]) order.bybitTpId = ids[0];
-          if (ids[1]) order.bybitSlId = ids[1];
-        }
-
-        const myTrades = await this.exchange.fetchMyTrades(signal.symbol, undefined, 5);
-        if (myTrades.length > 0) {
-          const matchTrade = myTrades.find((t: any) => t.order === entryResp.id || t.info?.orderId === entryResp.id) ?? myTrades[0];
-          if (matchTrade) {
-            order.bybitTranId = (matchTrade.id ?? (matchTrade.info as any)?.execId ?? "").slice(-8);
-          }
         }
       } catch (fErr) {
         // non-fatal
@@ -579,7 +570,6 @@ export class ExecutionEngine {
       console.log("═════════════════════════════════════════════════════");
       console.log("CCXT entryResp.id  :", entryResp.id);
       console.log("Order ID (slice-8) :", (rawOrderId ?? "").slice(-8));
-      console.log("Tran ID            :", order.bybitTranId ?? "—");
       console.log("TP / SL Order IDs  :", `${order.bybitTpId ?? "—"} / ${order.bybitSlId ?? "—"}`);
       console.log("Fill Price (Bybit) :", order.entryPrice);
       console.log("Filled Size (Bybit):", order.size);
@@ -589,7 +579,6 @@ export class ExecutionEngine {
       this.logger.info("[Engine] Live order placed", {
         entryOrderId: entryResp.id,
         bybitOrderId: (rawOrderId ?? "").slice(-8),
-        tranId: order.bybitTranId,
         tpId: order.bybitTpId,
         slId: order.bybitSlId,
         fillPrice: order.entryPrice,
@@ -639,7 +628,6 @@ export class ExecutionEngine {
 
       // 4. Place the order (paper or live)
       let exchangeOrderId: string | null = null;
-      let bybitTranId: string | undefined;
       let bybitTpId: string | undefined;
       let bybitSlId: string | undefined;
 
@@ -697,14 +685,6 @@ export class ExecutionEngine {
             if (ids[0]) bybitTpId = ids[0];
             if (ids[1]) bybitSlId = ids[1];
           }
-
-          const myTrades = await this.exchange.fetchMyTrades(this.config.symbol, undefined, 5);
-          if (myTrades.length > 0) {
-            const matchTrade = myTrades.find((t: any) => t.order === resp.id || t.info?.orderId === resp.id) ?? myTrades[0];
-            if (matchTrade) {
-              bybitTranId = (matchTrade.id ?? (matchTrade.info as any)?.execId ?? "").slice(-8);
-            }
-          }
         } catch (fErr) {
           // non-fatal
         }
@@ -717,7 +697,6 @@ export class ExecutionEngine {
         console.log("═════════════════════════════════════════════════════");
         console.log("CCXT resp.id       :", resp.id);
         console.log("Order ID (slice-8) :", (rawOrderId ?? "").slice(-8));
-        console.log("Tran ID            :", bybitTranId ?? "—");
         console.log("TP / SL Order IDs  :", `${bybitTpId ?? "—"} / ${bybitSlId ?? "—"}`);
         console.log("Fill Price (Bybit) :", price);
         console.log("Filled Size (Bybit):", rawSize);
@@ -727,7 +706,6 @@ export class ExecutionEngine {
         this.logger.info("[Engine] Test trade placed on Bybit", {
           orderId: exchangeOrderId,
           bybitOrderId: (rawOrderId ?? "").slice(-8),
-          tranId: bybitTranId,
           tpId: bybitTpId,
           slId: bybitSlId,
           fillPrice: price,
@@ -750,7 +728,6 @@ export class ExecutionEngine {
         placedAt: now,
         filledAt: now,
         closedAt: null,
-        bybitTranId,
         bybitTpId,
         bybitSlId,
       };

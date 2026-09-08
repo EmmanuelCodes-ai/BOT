@@ -68,7 +68,6 @@ export class TelegramNotifier {
     flow: string;
     score: number;
     isTest?: boolean;
-    tranId?: string;
     tpOrderId?: string;
     slOrderId?: string;
   }): void {
@@ -83,9 +82,6 @@ export class TelegramNotifier {
       : `${emoji} <b>AUTOMATED STRATEGY TRADE OPENED</b>\n<i>(Triggered automatically by strategy signal)</i>`;
 
     let ids = `Order ID  : <code>${bybitOrderId}</code> (Order History)\n`;
-    if (params.tranId) {
-      ids += `Tran ID   : <code>${params.tranId}</code> (Trade History)\n`;
-    }
     if (params.tpOrderId || params.slOrderId) {
       ids += `TP/SL IDs : <code>${[params.tpOrderId, params.slOrderId].filter(Boolean).join(" / ")}</code> (TP/SL tab)\n`;
     }

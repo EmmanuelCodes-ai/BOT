@@ -241,7 +241,6 @@ class TradingBot {
           flow: trade.flow.flow,
           score,
           isTest,
-          tranId: trade.order.bybitTranId,
           tpOrderId: trade.order.bybitTpId,
           slOrderId: trade.order.bybitSlId,
         });
@@ -325,7 +324,6 @@ class TradingBot {
             const orderId8 = rawId.startsWith("PAPER") ? "PAPER" : rawId.slice(-8);
             console.log(`[Command] Test trade executed successfully! Bybit order ID: ${rawId} (${orderId8})`);
             let extra = "";
-            if (trade.order.bybitTranId) extra += `\nTran ID   : <code>${trade.order.bybitTranId}</code> (Trade History)`;
             if (trade.order.bybitTpId || trade.order.bybitSlId) {
               extra += `\nTP/SL IDs : <code>${[trade.order.bybitTpId, trade.order.bybitSlId].filter(Boolean).join(" / ")}</code> (TP/SL tab)`;
             }
