@@ -9,6 +9,7 @@
     "dev": "ts-node src/index.ts",
     "test:connection": "ts-node src/test/connectionTest.ts",
     "check:balance": "ts-node src/test/checkBalance.ts",
+    "test:trade": "tsc && node dist/test/testTrade.js",
     "lint": "eslint src/**/*.ts"
   },
   "dependencies": {

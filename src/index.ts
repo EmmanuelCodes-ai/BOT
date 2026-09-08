@@ -310,16 +310,24 @@ class TradingBot {
 
         if (command === "/testtrade") {
           await this.poller!.sendMessage(id, "⏳ Placing test trade on Bybit — please wait...");
+          console.log(`[Command] /testtrade received from ${fromName}. Initiating test trade on Bybit...`);
           const trade = await this.engine.placeTestTrade();
           if (trade) {
-            // The onTradeUpdate callback already fires notifyTradeOpen via the engine,
-            // but we also confirm directly to the command sender.
+            const rawId = trade.order.exchangeOrderId ?? "PAPER";
+            console.log(`[Command] Test trade executed successfully! Bybit order ID: ${rawId}`);
             await this.poller!.sendMessage(
               id,
-              `✅ Test trade placed!\nBybit ID: <code>${(trade.order.exchangeOrderId ?? "PAPER").slice(0, 8)}</code>\n\nCheck your Bybit positions and compare the ID above.`
+              `✅ <b>Test trade placed on Bybit!</b>\n\n` +
+              `Bybit ID (8-char) : <code>${rawId.slice(0, 8)}</code>\n` +
+              `Full Order ID     : <code>${rawId}</code>\n\n` +
+              `Check your Bybit open positions / order history and Railway logs to verify.`
             );
           } else {
-            await this.poller!.sendMessage(id, "❌ Test trade failed. Check Railway logs for details.");
+            console.error(`[Command] /testtrade failed! Check above in Railway logs for the exact error from Bybit.`);
+            await this.poller!.sendMessage(
+              id,
+              "❌ <b>Test trade failed.</b>\nCheck Railway logs or terminal for the exact error from Bybit."
+            );
           }
 
         } else if (command === "/status") {

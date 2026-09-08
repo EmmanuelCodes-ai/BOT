@@ -516,12 +516,27 @@ export class ExecutionEngine {
       order.status = OrderStatus.FILLED;
       order.filledAt = Date.now();
 
+      const rawOrderId = (entryResp.info as any)?.orderId ?? entryResp.id;
+      const rawOrderLinkId = (entryResp.info as any)?.orderLinkId;
+
+      console.log("\n═════════════════════════════════════════════════════");
+      console.log("             BYBIT LIVE ORDER PLACED                 ");
+      console.log("═════════════════════════════════════════════════════");
+      console.log("CCXT entryResp.id  :", entryResp.id);
+      console.log("Bybit orderId      :", rawOrderId);
+      console.log("Bybit orderLinkId  :", rawOrderLinkId);
+      console.log("Full Bybit response:", JSON.stringify(entryResp.info ?? entryResp, null, 2));
+      console.log("═════════════════════════════════════════════════════\n");
+
       this.logger.info("[Engine] Live order placed", {
         entryOrderId: entryResp.id,
+        bybitOrderId: rawOrderId,
+        bybitOrderLinkId: rawOrderLinkId,
         sl,
         tp,
       });
     } catch (err) {
+      console.error("\n❌ [Engine] Order placement FAILED:", err);
       this.logger.error("[Engine] Order placement failed", { error: String(err) });
       order.status = OrderStatus.REJECTED;
       return null;
@@ -563,9 +578,13 @@ export class ExecutionEngine {
       // 4. Place the order (paper or live)
       let exchangeOrderId: string | null = null;
 
-      if (this.config.paperTrading) {
+      const hasApiKey = Boolean(this.exchange.apiKey && this.exchange.apiKey.trim().length > 5);
+
+      if (!hasApiKey && this.config.paperTrading) {
         exchangeOrderId = `PAPER-${uuidv4().slice(0, 8)}`;
+        console.log(`[Engine] No live API key configured; created paper test trade: ${exchangeOrderId}`);
       } else {
+        console.log(`[Engine] Submitting real minimal test trade to Bybit (${rawSize} ${this.config.symbol})...`);
         const resp = await this.exchange.createOrder(
           this.config.symbol,
           "market",
@@ -580,7 +599,24 @@ export class ExecutionEngine {
           }
         );
         exchangeOrderId = resp.id;
-        this.logger.info("[Engine] Test trade placed on Bybit", { orderId: exchangeOrderId });
+
+        const rawOrderId = (resp.info as any)?.orderId ?? resp.id;
+        const rawOrderLinkId = (resp.info as any)?.orderLinkId;
+
+        console.log("\n═════════════════════════════════════════════════════");
+        console.log("             BYBIT TEST TRADE PLACED                 ");
+        console.log("═════════════════════════════════════════════════════");
+        console.log("CCXT resp.id       :", resp.id);
+        console.log("Bybit orderId      :", rawOrderId);
+        console.log("Bybit orderLinkId  :", rawOrderLinkId);
+        console.log("Full Bybit response:", JSON.stringify(resp.info ?? resp, null, 2));
+        console.log("═════════════════════════════════════════════════════\n");
+
+        this.logger.info("[Engine] Test trade placed on Bybit", {
+          orderId: exchangeOrderId,
+          bybitOrderId: rawOrderId,
+          bybitOrderLinkId: rawOrderLinkId,
+        });
       }
 
       // 5. Build trade record and register in ledger/state
