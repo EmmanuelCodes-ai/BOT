@@ -156,11 +156,11 @@ export class ExecutionEngine {
       strategyId: signal.strategyId,
       flow: signal.flow,
       direction: signal.direction,
-      entryPrice: entry,
+      entryPrice: order.entryPrice,
       exitPrice: null,
-      stopLoss: sl,
-      takeProfit: tp,
-      size,
+      stopLoss: order.stopLoss,
+      takeProfit: order.takeProfit,
+      size: order.size,
       pnlRaw: null,
       pnlR: null,
       outcome: TradeOutcome.OPEN,
@@ -174,7 +174,7 @@ export class ExecutionEngine {
     };
 
     this.state.openTrades.set(trade.id, trade);
-    this.ledger.recordOpen(trade, entry);
+    this.ledger.recordOpen(trade, order.entryPrice);
     this.onTradeUpdate?.(trade);
 
     this.logger.info("[Engine] Trade OPENED", {
@@ -516,6 +516,33 @@ export class ExecutionEngine {
       order.status = OrderStatus.FILLED;
       order.filledAt = Date.now();
 
+      // Fetch real execution details directly from Bybit API
+      let actualFillPrice = entryResp.average ?? entryResp.price ?? entry;
+      let actualFilledSize = entryResp.filled ?? size;
+      let actualStopLoss = (entryResp as any).stopLoss ?? sl;
+      let actualTakeProfit = (entryResp as any).takeProfit ?? tp;
+
+      try {
+        await new Promise((r) => setTimeout(r, 250));
+        const fetched: any = await this.exchange.fetchOrder(entryResp.id, signal.symbol);
+        if (fetched) {
+          const p = fetched.average ?? fetched.price;
+          if (p && p > 0) actualFillPrice = p;
+          if (fetched.filled && fetched.filled > 0) actualFilledSize = fetched.filled;
+          const fetchedSl = parseFloat(fetched.stopLoss ?? fetched.info?.stopLoss);
+          const fetchedTp = parseFloat(fetched.takeProfit ?? fetched.info?.takeProfit);
+          if (fetchedSl && fetchedSl > 0) actualStopLoss = fetchedSl;
+          if (fetchedTp && fetchedTp > 0) actualTakeProfit = fetchedTp;
+        }
+      } catch (fErr) {
+        this.logger.warn("[Engine] Could not fetch filled order details from Bybit API", { error: String(fErr) });
+      }
+
+      order.entryPrice = actualFillPrice;
+      order.size = actualFilledSize;
+      order.stopLoss = actualStopLoss;
+      order.takeProfit = actualTakeProfit;
+
       const rawOrderId = (entryResp.info as any)?.orderId ?? entryResp.id;
       const rawOrderLinkId = (entryResp.info as any)?.orderLinkId;
 
@@ -525,6 +552,8 @@ export class ExecutionEngine {
       console.log("CCXT entryResp.id  :", entryResp.id);
       console.log("Bybit orderId      :", rawOrderId);
       console.log("Bybit orderLinkId  :", rawOrderLinkId);
+      console.log("Fill Price (Bybit) :", order.entryPrice);
+      console.log("Filled Size (Bybit):", order.size);
       console.log("Full Bybit response:", JSON.stringify(entryResp.info ?? entryResp, null, 2));
       console.log("═════════════════════════════════════════════════════\n");
 
@@ -532,8 +561,10 @@ export class ExecutionEngine {
         entryOrderId: entryResp.id,
         bybitOrderId: rawOrderId,
         bybitOrderLinkId: rawOrderLinkId,
-        sl,
-        tp,
+        fillPrice: order.entryPrice,
+        size: order.size,
+        sl: order.stopLoss,
+        tp: order.takeProfit,
       });
     } catch (err) {
       console.error("\n❌ [Engine] Order placement FAILED:", err);
@@ -555,21 +586,21 @@ export class ExecutionEngine {
     try {
       // 1. Get current price
       const ticker = await this.exchange.fetchTicker(this.config.symbol);
-      const price = ticker.last ?? ticker.close ?? 0;
+      let price = ticker.last ?? ticker.close ?? 0;
       if (price <= 0) throw new Error("Could not fetch current price");
 
       // 2. Use minimum allowed size for BTC/USDT:USDT on Bybit (0.001 BTC)
       const market = this.exchange.markets?.[this.config.symbol];
       const minSize = market?.limits?.amount?.min ?? 0.001;
-      const rawSize = parseFloat(
+      let rawSize = parseFloat(
         this.exchange.amountToPrecision(this.config.symbol, minSize)
       );
 
       // 3. Tight SL/TP — 0.5% away (minimum to pass Bybit validation)
-      const sl = parseFloat(
+      let sl = parseFloat(
         this.exchange.priceToPrecision(this.config.symbol, price * 0.995)
       );
-      const tp = parseFloat(
+      let tp = parseFloat(
         this.exchange.priceToPrecision(this.config.symbol, price * 1.005)
       );
 
@@ -600,6 +631,23 @@ export class ExecutionEngine {
         );
         exchangeOrderId = resp.id;
 
+        // Fetch real execution details from Bybit
+        try {
+          await new Promise((r) => setTimeout(r, 250));
+          const fetched: any = await this.exchange.fetchOrder(resp.id, this.config.symbol);
+          if (fetched) {
+            const p = fetched.average ?? fetched.price;
+            if (p && p > 0) price = p;
+            if (fetched.filled && fetched.filled > 0) rawSize = fetched.filled;
+            const fetchedSl = parseFloat(fetched.stopLoss ?? fetched.info?.stopLoss);
+            const fetchedTp = parseFloat(fetched.takeProfit ?? fetched.info?.takeProfit);
+            if (fetchedSl && fetchedSl > 0) sl = fetchedSl;
+            if (fetchedTp && fetchedTp > 0) tp = fetchedTp;
+          }
+        } catch (fErr) {
+          this.logger.warn("[Engine] Could not fetch filled order details for test trade", { error: String(fErr) });
+        }
+
         const rawOrderId = (resp.info as any)?.orderId ?? resp.id;
         const rawOrderLinkId = (resp.info as any)?.orderLinkId;
 
@@ -609,6 +657,8 @@ export class ExecutionEngine {
         console.log("CCXT resp.id       :", resp.id);
         console.log("Bybit orderId      :", rawOrderId);
         console.log("Bybit orderLinkId  :", rawOrderLinkId);
+        console.log("Fill Price (Bybit) :", price);
+        console.log("Filled Size (Bybit):", rawSize);
         console.log("Full Bybit response:", JSON.stringify(resp.info ?? resp, null, 2));
         console.log("═════════════════════════════════════════════════════\n");
 
@@ -616,6 +666,8 @@ export class ExecutionEngine {
           orderId: exchangeOrderId,
           bybitOrderId: rawOrderId,
           bybitOrderLinkId: rawOrderLinkId,
+          fillPrice: price,
+          size: rawSize,
         });
       }
 

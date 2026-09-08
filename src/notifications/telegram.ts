@@ -67,24 +67,31 @@ export class TelegramNotifier {
     size: number;
     flow: string;
     score: number;
+    isTest?: boolean;
   }): void {
     if (!this.enabled) return;
 
     const emoji = params.direction === "LONG" ? "🟢" : "🔴";
     const rawId = params.exchangeOrderId ?? "";
     const bybitId = rawId.startsWith("PAPER") ? "PAPER" : (rawId.slice(0, 8) || "—");
+
+    const header = params.isTest
+      ? `🧪 <b>MANUAL TEST TRADE OPENED</b>\n<i>(Triggered manually via /testtrade)</i>`
+      : `${emoji} <b>AUTOMATED STRATEGY TRADE OPENED</b>\n<i>(Triggered automatically by strategy signal)</i>`;
+
     const msg =
-      `${emoji} <b>TRADE OPENED</b>\n\n` +
+      `${header}\n\n` +
       `Strategy : ${params.strategy}\n` +
-      `Direction : ${params.direction}\n` +
+      `Direction: ${params.direction}\n` +
       `Symbol   : ${params.symbol}\n` +
-      `Entry    : ${params.entry}\n` +
+      `Entry    : ${params.entry} (Bybit API Fill)\n` +
       `Stop Loss: ${params.stopLoss}\n` +
       `Take Profit: ${params.takeProfit}\n` +
       `Size     : ${params.size}\n` +
       `Flow     : ${params.flow}\n` +
       `Score    : ${params.score}\n` +
       `Bybit ID : <code>${bybitId}</code>\n` +
+      `Full ID  : <code>${rawId || "—"}</code>\n` +
       `Bot ID   : ${params.id.slice(0, 8)}`;
 
     sendMessage(this.token, this.chatId, msg);
@@ -99,6 +106,7 @@ export class TelegramNotifier {
     exitPrice: number;
     strategy: string;
     durationMin: number;
+    isTest?: boolean;
   }): void {
     if (!this.enabled) return;
 
@@ -110,13 +118,18 @@ export class TelegramNotifier {
     const rawId = params.exchangeOrderId ?? "";
     const bybitId = rawId.startsWith("PAPER") ? "PAPER" : (rawId.slice(0, 8) || "—");
 
+    const header = params.isTest
+      ? `🧪 <b>MANUAL TEST TRADE CLOSED — ${params.outcome}</b>`
+      : `${emoji} <b>AUTOMATED STRATEGY TRADE CLOSED — ${params.outcome}</b>`;
+
     const msg =
-      `${emoji} <b>TRADE CLOSED — ${params.outcome}</b>\n\n` +
+      `${header}\n\n` +
       `Strategy : ${params.strategy}\n` +
-      `Exit     : ${params.exitPrice}\n` +
+      `Exit     : ${params.exitPrice} (Bybit API Fill)\n` +
       `PnL      : ${pnlSign}${params.pnlRaw.toFixed(4)} (${pnlSign}${params.pnlR.toFixed(2)}R)\n` +
       `Duration : ${params.durationMin}m\n` +
       `Bybit ID : <code>${bybitId}</code>\n` +
+      `Full ID  : <code>${rawId || "—"}</code>\n` +
       `Bot ID   : ${params.id.slice(0, 8)}`;
 
     sendMessage(this.token, this.chatId, msg);

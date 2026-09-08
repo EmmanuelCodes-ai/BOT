@@ -199,6 +199,7 @@ class TradingBot {
   private latestEvaluation: EvaluationRecord | null = null;
   private lastSignal: any = null;
   private lastPrice: number = 0;
+  private autoTradingEnabled: boolean = true;
 
   constructor(
     config: BotConfig,
@@ -221,6 +222,8 @@ class TradingBot {
     this.engine.onTradeUpdate = (trade) => {
       this.logger.logTrade(trade);
 
+      const isTest = trade.signalId === "TEST";
+
       if (trade.outcome === "OPEN") {
         const scoreMatch = trade.notes.match(/Score:\s*(\d+)/);
         const score = scoreMatch ? parseInt(scoreMatch[1], 10) : 0;
@@ -237,6 +240,7 @@ class TradingBot {
           size: trade.size,
           flow: trade.flow.flow,
           score,
+          isTest,
         });
 
         // Gemini proactive analysis on trade open
@@ -258,6 +262,7 @@ class TradingBot {
           exitPrice: trade.exitPrice ?? 0,
           strategy: trade.strategyId,
           durationMin: Math.round((trade.durationMs ?? 0) / 60000),
+          isTest,
         });
 
         // Gemini proactive analysis on trade close
@@ -330,25 +335,51 @@ class TradingBot {
             );
           }
 
+        } else if (command === "/pause" || command === "/trading off") {
+          this.autoTradingEnabled = false;
+          console.log("[Bot] Automated trading PAUSED by user command.");
+          await this.poller!.sendMessage(
+            id,
+            "⏸️ <b>Automated Strategy Trading PAUSED</b>\n\n" +
+            "• The bot will <b>NOT</b> open any automatic strategy trades.\n" +
+            "• You can still place manual test trades anytime via <code>/testtrade</code>.\n" +
+            "• Use <code>/resume</code> when you are ready to enable automatic trading again."
+          );
+
+        } else if (command === "/resume" || command === "/trading on") {
+          this.autoTradingEnabled = true;
+          console.log("[Bot] Automated trading RESUMED by user command.");
+          await this.poller!.sendMessage(
+            id,
+            "▶️ <b>Automated Strategy Trading RESUMED</b>\n\n" +
+            "• The bot is now actively monitoring market candles and will execute trades automatically when strategy signals trigger."
+          );
+
         } else if (command === "/status") {
           const bal = this.engine.getLatestBalanceInfo();
           const open = this.engine.getOpenTradeCount();
           const ind = this.latestIndicators;
+          const mode = this.config.paperTrading ? "PAPER TRADING" : "LIVE BYBIT";
+          const autoStatus = this.autoTradingEnabled ? "ACTIVE ▶️" : "PAUSED ⏸️";
           const msg =
             `📊 <b>Bot Status</b>\n\n` +
-            `Symbol   : ${this.config.symbol}\n` +
-            `Price    : $${this.lastPrice || "—"}\n` +
-            `RSI(14)  : ${ind ? ind.rsi14.toFixed(1) : "—"}\n` +
-            `Equity   : $${bal.equity.toFixed(2)}\n` +
-            `Available: $${bal.availableBalance.toFixed(2)}\n` +
-            `Open Pos : ${open}`;
+            `Trading Mode : ${mode}\n` +
+            `Auto Trades  : ${autoStatus}\n` +
+            `Symbol       : ${this.config.symbol}\n` +
+            `Price        : $${this.lastPrice || "—"}\n` +
+            `RSI(14)      : ${ind ? ind.rsi14.toFixed(1) : "—"}\n` +
+            `Equity       : $${bal.equity.toFixed(2)}\n` +
+            `Available    : $${bal.availableBalance.toFixed(2)}\n` +
+            `Open Pos     : ${open}`;
           await this.poller!.sendMessage(id, msg);
 
         } else if (command === "/help") {
           await this.poller!.sendMessage(id,
             `🤖 <b>Bot Commands</b>\n\n` +
-            `/testtrade — Preview trade notification format\n` +
-            `/status — Current price, balance & RSI\n` +
+            `/testtrade — Place a real minimal test trade on Bybit to verify order IDs\n` +
+            `/pause — Pause automated strategy trades (safe testing)\n` +
+            `/resume — Resume automated strategy trades\n` +
+            `/status — Current price, balance & trade status\n` +
             `/help — Show this menu\n\n` +
             `Or just type any question to chat with the AI analyst.`
           );
@@ -484,16 +515,23 @@ class TradingBot {
       this.lastSignal = output.signal; // store for Gemini context
       this.logger.logSignal(output.signal);
 
-      const trade = await this.engine.execute(
-        output.signal,
-        latestCandle.timestamp
-      );
-
-      if (trade) {
-        this.logger.info("Trade execution confirmed", {
-          tradeId: trade.id.slice(0, 8),
-          strategy: trade.strategyId,
+      if (!this.autoTradingEnabled) {
+        this.logger.info("[Bot] Automated strategy trading is PAUSED — skipping signal execution", {
+          strategy: output.signal.strategyId,
+          direction: output.signal.direction,
         });
+      } else {
+        const trade = await this.engine.execute(
+          output.signal,
+          latestCandle.timestamp
+        );
+
+        if (trade) {
+          this.logger.info("Trade execution confirmed", {
+            tradeId: trade.id.slice(0, 8),
+            strategy: trade.strategyId,
+          });
+        }
       }
     }
 
