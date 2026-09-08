@@ -9,7 +9,7 @@ import * as https from "https";
 
 const NIM_HOST = "integrate.api.nvidia.com";
 const NIM_PATH = "/v1/chat/completions";
-const MODEL = "moonshotai/kimi-k3";
+const MODEL = process.env.NVIDIA_MODEL ?? "moonshotai/kimi-k3";
 
 // ── Bot context snapshot & telemetry ────────────────────────
 
@@ -227,10 +227,15 @@ function nimAttempt(messages: ChatMessage[], apiKey: string): Promise<string> {
     };
 
     const req = https.request(options, (res) => {
-      // Treat server-side overload codes as retryable errors
-      if (res.statusCode === 529 || res.statusCode === 503 || res.statusCode === 502) {
-        res.resume(); // drain response body
-        reject(new Error(`NIM_OVERLOAD:${res.statusCode}`));
+      // Check for non-200 HTTP status
+      if (res.statusCode && res.statusCode !== 200) {
+        let errBody = "";
+        res.on("data", (chunk: Buffer) => {
+          errBody += chunk.toString("utf8");
+        });
+        res.on("end", () => {
+          reject(new Error(`NIM_ERROR_${res.statusCode}: ${errBody.slice(0, 300)}`));
+        });
         return;
       }
 
@@ -259,7 +264,6 @@ function nimAttempt(messages: ChatMessage[], apiKey: string): Promise<string> {
 
       res.on("end", () => {
         const result = fullText.trim();
-        console.log(`[Analyst] Response received (${result.length} chars)`);
         resolve(result);
       });
 
@@ -268,10 +272,10 @@ function nimAttempt(messages: ChatMessage[], apiKey: string): Promise<string> {
 
     req.on("error", reject);
 
-    // 120 second timeout
-    req.setTimeout(120000, () => {
+    // 25 second timeout for snappy response & fast failover
+    req.setTimeout(25000, () => {
       req.destroy();
-      reject(new Error("NIM request timed out after 120s"));
+      reject(new Error("NIM request timed out after 25s"));
     });
 
     req.write(body);
@@ -279,9 +283,7 @@ function nimAttempt(messages: ChatMessage[], apiKey: string): Promise<string> {
   });
 }
 
-// ── API key pool (rotation on rate-limit) ────────────────────
-// Loads keys from NVIDIA_API_KEY_1, NVIDIA_API_KEY_2, … NVIDIA_API_KEY_N.
-// Falls back to the legacy NVIDIA_API_KEY if numbered keys are absent.
+// ── API key pool (rotation on rate-limit / timeout) ─────────
 function loadApiKeys(): string[] {
   const keys: string[] = [];
   let i = 1;
@@ -299,11 +301,9 @@ function loadApiKeys(): string[] {
   return keys;
 }
 
-// ── HTTP request with key rotation + exponential-backoff retry ─
-// On overload/rate-limit: rotates to the next key before retrying.
-// Total attempts = MAX_RETRIES_PER_KEY × number of keys.
+// ── HTTP request with key rotation + retry ───────────────────
 const MAX_RETRIES_PER_KEY = 2;
-const BASE_DELAY_MS = 5_000;
+const BASE_DELAY_MS = 2_000;
 
 async function nimRequest(
   messages: ChatMessage[],
@@ -324,23 +324,28 @@ async function nimRequest(
       return { text, keyIndex };
     } catch (err: any) {
       lastErr = err;
-      const isOverload =
-        String(err?.message ?? "").startsWith("NIM_OVERLOAD") ||
-        String(err?.message ?? "").toLowerCase().includes("overload") ||
-        String(err?.message ?? "").toLowerCase().includes("too many") ||
-        String(err?.message ?? "").toLowerCase().includes("rate limit");
+      const errMsg = String(err?.message ?? "").toLowerCase();
+      const isRetryable =
+        errMsg.includes("nim_") ||
+        errMsg.includes("timeout") ||
+        errMsg.includes("timed out") ||
+        errMsg.includes("overload") ||
+        errMsg.includes("too many") ||
+        errMsg.includes("rate limit") ||
+        errMsg.includes("socket") ||
+        errMsg.includes("econn");
 
-      if (!isOverload) throw err; // non-retryable error — fail immediately
+      if (!isRetryable && keys.length <= 1) throw err;
 
       // Rotate to next key
       const nextKeyIndex = (keyIndex + 1) % keys.length;
       console.warn(
-        `[Analyst] Rate-limit/overload on key ${keyIndex + 1}/${keys.length} (attempt ${attempt + 1}/${totalAttempts}). ` +
+        `[Analyst] Issue on key ${keyIndex + 1}/${keys.length} (${err?.message}). ` +
         `Rotating to key ${nextKeyIndex + 1}...`
       );
       keyIndex = nextKeyIndex;
 
-      const delayMs = BASE_DELAY_MS * Math.pow(2, Math.floor(attempt / keys.length)); // 5s, 10s, 20s per round
+      const delayMs = BASE_DELAY_MS * Math.pow(1.5, Math.floor(attempt / keys.length));
       await new Promise((r) => setTimeout(r, delayMs));
     }
   }
