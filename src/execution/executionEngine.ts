@@ -560,9 +560,9 @@ export class ExecutionEngine {
           if (ids[1]) order.bybitSlId = ids[1];
         }
 
-        const myTrades = await this.exchange.fetchMyTrades(signal.symbol, undefined, 2);
+        const myTrades = await this.exchange.fetchMyTrades(signal.symbol, undefined, 5);
         if (myTrades.length > 0) {
-          const matchTrade = myTrades.find((t) => t.order === entryResp.id) ?? myTrades[myTrades.length - 1];
+          const matchTrade = myTrades.find((t: any) => t.order === entryResp.id || t.info?.orderId === entryResp.id) ?? myTrades[0];
           if (matchTrade) {
             order.bybitTranId = (matchTrade.id ?? (matchTrade.info as any)?.execId ?? "").slice(-8);
           }
@@ -698,9 +698,9 @@ export class ExecutionEngine {
             if (ids[1]) bybitSlId = ids[1];
           }
 
-          const myTrades = await this.exchange.fetchMyTrades(this.config.symbol, undefined, 2);
+          const myTrades = await this.exchange.fetchMyTrades(this.config.symbol, undefined, 5);
           if (myTrades.length > 0) {
-            const matchTrade = myTrades.find((t: any) => t.order === resp.id) ?? myTrades[myTrades.length - 1];
+            const matchTrade = myTrades.find((t: any) => t.order === resp.id || t.info?.orderId === resp.id) ?? myTrades[0];
             if (matchTrade) {
               bybitTranId = (matchTrade.id ?? (matchTrade.info as any)?.execId ?? "").slice(-8);
             }
