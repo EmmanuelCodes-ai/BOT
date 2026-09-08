@@ -36,7 +36,7 @@ import { FlowClassifier } from "./classifier";
 import { ExecutionEngine } from "./execution";
 import { BotLogger } from "./logger";
 import { buildStrategyRegistry } from "./strategies";
-import { startHealthServer, registerTestSummaryCallback } from "./healthCheck";
+import { startHealthServer } from "./healthCheck";
 import { TelegramNotifier } from "./notifications";
 import { TelegramPoller } from "./notifications/telegramPoller";
 import { GeminiAnalyst, BotContext } from "./analyst";
@@ -226,8 +226,6 @@ class TradingBot {
     this.engine.onTradeUpdate = (trade) => {
       this.logger.logTrade(trade);
 
-      const isTest = trade.signalId === "TEST";
-
       if (trade.outcome === "OPEN") {
         const scoreMatch = trade.notes.match(/Score:\s*(\d+)/);
         const score = scoreMatch ? parseInt(scoreMatch[1], 10) : 0;
@@ -244,7 +242,6 @@ class TradingBot {
           size: trade.size,
           flow: trade.flow.flow,
           score,
-          isTest,
           tpOrderId: trade.order.bybitTpId,
           slOrderId: trade.order.bybitSlId,
         });
@@ -268,7 +265,6 @@ class TradingBot {
           exitPrice: trade.exitPrice ?? 0,
           strategy: trade.strategyId,
           durationMin: Math.round((trade.durationMs ?? 0) / 60000),
-          isTest,
           partialPnlRaw: trade.partialPnlRaw ?? undefined,
           partialPnlR: trade.partialPnlR ?? undefined,
         });
@@ -321,9 +317,6 @@ class TradingBot {
       "24/7 — daily summary at 00:00 WAT"
     );
 
-    // Register test summary endpoint
-    registerTestSummaryCallback(() => this.fireDailySummary(true));
-
     // Start Telegram message poller for chat with Gemini
     const token = process.env.TELEGRAM_TOKEN ?? "";
     const chatId = process.env.TELEGRAM_CHAT_ID ?? "";
@@ -342,42 +335,13 @@ class TradingBot {
       this.poller.setCommandHandler(async (id, command, fromName) => {
         this.logger.info(`[Command] ${fromName}: ${command}`);
 
-        if (command === "/testtrade") {
-          await this.poller!.sendMessage(id, "⏳ Placing test trade on Bybit — please wait...");
-          console.log(`[Command] /testtrade received from ${fromName}. Initiating test trade on Bybit...`);
-          const trade = await this.engine.placeTestTrade();
-          if (trade) {
-            const rawId = trade.order.exchangeOrderId ?? "PAPER";
-            const orderId8 = rawId.startsWith("PAPER") ? "PAPER" : rawId.slice(-8);
-            console.log(`[Command] Test trade executed successfully! Bybit order ID: ${rawId} (${orderId8})`);
-            let extra = "";
-            if (trade.order.bybitTpId || trade.order.bybitSlId) {
-              extra += `\nTP/SL IDs : <code>${[trade.order.bybitTpId, trade.order.bybitSlId].filter(Boolean).join(" / ")}</code> (TP/SL tab)`;
-            }
-            await this.poller!.sendMessage(
-              id,
-              `✅ <b>Test trade placed on Bybit!</b>\n\n` +
-              `Order ID  : <code>${orderId8}</code> (Order History)\n` +
-              `Full UUID : <code>${rawId}</code>` +
-              extra +
-              `\n\nCheck your Bybit Order History tab — it matches <code>${orderId8}</code> exactly!`
-            );
-          } else {
-            console.error(`[Command] /testtrade failed! Check above in Railway logs for the exact error from Bybit.`);
-            await this.poller!.sendMessage(
-              id,
-              "❌ <b>Test trade failed.</b>\nCheck Railway logs or terminal for the exact error from Bybit."
-            );
-          }
-
-        } else if (command === "/pause" || command === "/trading off") {
+        if (command === "/pause" || command === "/trading off") {
           this.autoTradingEnabled = false;
           console.log("[Bot] Automated trading PAUSED by user command.");
           await this.poller!.sendMessage(
             id,
             "⏸️ <b>Automated Strategy Trading PAUSED</b>\n\n" +
             "• The bot will <b>NOT</b> open any automatic strategy trades.\n" +
-            "• You can still place manual test trades anytime via <code>/testtrade</code>.\n" +
             "• Use <code>/resume</code> when you are ready to enable automatic trading again."
           );
 
@@ -411,8 +375,7 @@ class TradingBot {
         } else if (command === "/help") {
           await this.poller!.sendMessage(id,
             `🤖 <b>Bot Commands</b>\n\n` +
-            `/testtrade — Place a real minimal test trade on Bybit to verify order IDs\n` +
-            `/pause — Pause automated strategy trades (safe testing)\n` +
+            `/pause — Pause automated strategy trades\n` +
             `/resume — Resume automated strategy trades\n` +
             `/status — Current price, balance & trade status\n` +
             `/help — Show this menu\n\n` +

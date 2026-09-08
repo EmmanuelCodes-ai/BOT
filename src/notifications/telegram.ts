@@ -67,7 +67,6 @@ export class TelegramNotifier {
     size: number;
     flow: string;
     score: number;
-    isTest?: boolean;
     tpOrderId?: string;
     slOrderId?: string;
   }): void {
@@ -77,9 +76,7 @@ export class TelegramNotifier {
     const rawId = params.exchangeOrderId ?? "";
     const bybitOrderId = rawId.startsWith("PAPER") ? "PAPER" : (rawId.slice(-8) || "—");
 
-    const header = params.isTest
-      ? `🧪 <b>MANUAL TEST TRADE OPENED</b>\n<i>(Triggered manually via /testtrade)</i>`
-      : `${emoji} <b>AUTOMATED STRATEGY TRADE OPENED</b>\n<i>(Triggered automatically by strategy signal)</i>`;
+    const header = `${emoji} <b>AUTOMATED STRATEGY TRADE OPENED</b>\n<i>(Triggered automatically by strategy signal)</i>`;
 
     let ids = `Order ID  : <code>${bybitOrderId}</code> (Order History)\n`;
     if (params.tpOrderId || params.slOrderId) {
@@ -141,7 +138,6 @@ export class TelegramNotifier {
     exitPrice: number;
     strategy: string;
     durationMin: number;
-    isTest?: boolean;
     partialPnlRaw?: number;
     partialPnlR?: number;
   }): void {
@@ -155,9 +151,7 @@ export class TelegramNotifier {
     const rawId = params.exchangeOrderId ?? "";
     const bybitOrderId = rawId.startsWith("PAPER") ? "PAPER" : (rawId.slice(-8) || "—");
 
-    const header = params.isTest
-      ? `🧪 <b>MANUAL TEST TRADE CLOSED — ${params.outcome}</b>`
-      : `${emoji} <b>AUTOMATED STRATEGY TRADE CLOSED — ${params.outcome}</b>`;
+    const header = `${emoji} <b>AUTOMATED STRATEGY TRADE CLOSED — ${params.outcome}</b>`;
 
     let partialInfo = "";
     if (params.partialPnlRaw !== undefined && params.partialPnlRaw > 0) {

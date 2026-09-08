@@ -279,33 +279,68 @@ function nimAttempt(messages: ChatMessage[], apiKey: string): Promise<string> {
   });
 }
 
-// ── HTTP request with exponential-backoff retry ──────────────
-// Retries up to MAX_RETRIES times on overload/transient errors.
-// Delays: 5s → 10s → 20s → 40s
-const MAX_RETRIES = 4;
+// ── API key pool (rotation on rate-limit) ────────────────────
+// Loads keys from NVIDIA_API_KEY_1, NVIDIA_API_KEY_2, … NVIDIA_API_KEY_N.
+// Falls back to the legacy NVIDIA_API_KEY if numbered keys are absent.
+function loadApiKeys(): string[] {
+  const keys: string[] = [];
+  let i = 1;
+  while (true) {
+    const k = process.env[`NVIDIA_API_KEY_${i}`];
+    if (!k) break;
+    keys.push(k);
+    i++;
+  }
+  // Fall back to legacy single-key env var
+  if (keys.length === 0) {
+    const legacy = process.env.NVIDIA_API_KEY ?? "";
+    if (legacy) keys.push(legacy);
+  }
+  return keys;
+}
+
+// ── HTTP request with key rotation + exponential-backoff retry ─
+// On overload/rate-limit: rotates to the next key before retrying.
+// Total attempts = MAX_RETRIES_PER_KEY × number of keys.
+const MAX_RETRIES_PER_KEY = 2;
 const BASE_DELAY_MS = 5_000;
 
-async function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
-  let lastErr: Error = new Error("Unknown NIM error");
+async function nimRequest(
+  messages: ChatMessage[],
+  keys: string[],
+  startKeyIndex: number = 0
+): Promise<{ text: string; keyIndex: number }> {
+  if (keys.length === 0) throw new Error("No NVIDIA API keys configured");
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  let lastErr: Error = new Error("Unknown NIM error");
+  let keyIndex = startKeyIndex % keys.length;
+
+  const totalAttempts = MAX_RETRIES_PER_KEY * keys.length;
+
+  for (let attempt = 0; attempt < totalAttempts; attempt++) {
+    const currentKey = keys[keyIndex];
     try {
-      return await nimAttempt(messages, apiKey);
+      const text = await nimAttempt(messages, currentKey);
+      return { text, keyIndex };
     } catch (err: any) {
       lastErr = err;
       const isOverload =
         String(err?.message ?? "").startsWith("NIM_OVERLOAD") ||
         String(err?.message ?? "").toLowerCase().includes("overload") ||
-        String(err?.message ?? "").toLowerCase().includes("too many");
+        String(err?.message ?? "").toLowerCase().includes("too many") ||
+        String(err?.message ?? "").toLowerCase().includes("rate limit");
 
-      if (!isOverload || attempt === MAX_RETRIES - 1) {
-        throw err; // non-retryable or exhausted retries
-      }
+      if (!isOverload) throw err; // non-retryable error — fail immediately
 
-      const delayMs = BASE_DELAY_MS * Math.pow(2, attempt); // 5s, 10s, 20s
+      // Rotate to next key
+      const nextKeyIndex = (keyIndex + 1) % keys.length;
       console.warn(
-        `[Analyst] Model overloaded (attempt ${attempt + 1}/${MAX_RETRIES}). Retrying in ${delayMs / 1000}s...`
+        `[Analyst] Rate-limit/overload on key ${keyIndex + 1}/${keys.length} (attempt ${attempt + 1}/${totalAttempts}). ` +
+        `Rotating to key ${nextKeyIndex + 1}...`
       );
+      keyIndex = nextKeyIndex;
+
+      const delayMs = BASE_DELAY_MS * Math.pow(2, Math.floor(attempt / keys.length)); // 5s, 10s, 20s per round
       await new Promise((r) => setTimeout(r, delayMs));
     }
   }
@@ -315,18 +350,19 @@ async function nimRequest(messages: ChatMessage[], apiKey: string): Promise<stri
 
 // ── Analyst class ───────────────────────────────────────────
 export class GeminiAnalyst {
-  private apiKey: string;
+  private apiKeys: string[];
+  private currentKeyIndex: number = 0;
   private enabled: boolean;
   private chatHistory: ChatMessage[] = [];
 
   constructor() {
-    this.apiKey = process.env.NVIDIA_API_KEY ?? "";
-    this.enabled = Boolean(this.apiKey);
+    this.apiKeys = loadApiKeys();
+    this.enabled = this.apiKeys.length > 0;
 
     if (!this.enabled) {
-      console.warn("[Analyst] NVIDIA_API_KEY missing — analyst disabled");
+      console.warn("[Analyst] No NVIDIA API keys found — analyst disabled. Add NVIDIA_API_KEY_1 (or NVIDIA_API_KEY) to env.");
     } else {
-      console.log(`[Analyst] Kimi K3 via NVIDIA NIM initialised with Chart & Ledger access`);
+      console.log(`[Analyst] Kimi K3 via NVIDIA NIM initialised — ${this.apiKeys.length} key(s) in rotation pool`);
     }
   }
 
@@ -429,7 +465,8 @@ Summarize today's performance, audit every dollar gained/lost, evaluate current 
     ];
 
     try {
-      const reply = await nimRequest(messages, this.apiKey);
+      const { text: reply, keyIndex } = await nimRequest(messages, this.apiKeys, this.currentKeyIndex);
+      this.currentKeyIndex = keyIndex; // stick with the key that worked
 
       this.chatHistory.push({ role: "user", content: userMessage });
       this.chatHistory.push({ role: "assistant", content: reply });
@@ -449,7 +486,8 @@ Summarize today's performance, audit every dollar gained/lost, evaluate current 
 
   private async generate(messages: ChatMessage[]): Promise<string | null> {
     try {
-      const text = await nimRequest(messages, this.apiKey);
+      const { text, keyIndex } = await nimRequest(messages, this.apiKeys, this.currentKeyIndex);
+      this.currentKeyIndex = keyIndex; // remember which key succeeded
       return text.length > 10 ? text : null;
     } catch (err: any) {
       console.error("[Analyst] Generation error:", err.message);
