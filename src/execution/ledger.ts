@@ -27,6 +27,9 @@ export interface PositionLedgerEntry {
   maxAdversePnLUSD: number;
   openedAt: number;
   durationMinutes: number;
+  partialRealizedUSD?: number;
+  partialRealizedR?: number;
+  isBreakeven?: boolean;
 }
 
 export interface ClosedTradeLedgerEntry {
@@ -46,6 +49,8 @@ export interface ClosedTradeLedgerEntry {
   openedAt: number;
   closedAt: number;
   durationMinutes: number;
+  partialRealizedUSD?: number;
+  partialRealizedR?: number;
   notes: string;
 }
 
@@ -213,14 +218,42 @@ export class TradeLedger {
     return closedEntry;
   }
 
+  // ── Record a partial profit close ──────────────────────────
+  recordPartialClose(
+    trade: Trade,
+    closedSize: number,
+    exitPrice: number,
+    pnlUSD: number,
+    pnlR: number,
+    newStopLoss: number
+  ): void {
+    const pos = this.openPositions.get(trade.id);
+    if (!pos) return;
+
+    pos.size = parseFloat((pos.size - closedSize).toFixed(8));
+    pos.stopLoss = newStopLoss;
+    pos.isBreakeven = true;
+    pos.partialRealizedUSD = parseFloat(((pos.partialRealizedUSD ?? 0) + pnlUSD).toFixed(4));
+    pos.partialRealizedR = parseFloat(((pos.partialRealizedR ?? 0) + pnlR).toFixed(3));
+
+    const stopDist = Math.abs(pos.entryPrice - pos.stopLoss);
+    pos.riskUSD = parseFloat((stopDist * pos.size).toFixed(4));
+    pos.notionalUSD = parseFloat((pos.entryPrice * pos.size).toFixed(4));
+
+    this.updateEquityAndDrawdown();
+    this.saveToDisk();
+  }
+
   // ── Get financial snapshot ─────────────────────────────────
   getFinancialSnapshot(live?: { equity: number; walletBalance: number; availableBalance: number } | number): AccountFinancialSnapshot {
     const liveObj = typeof live === "number"
       ? { equity: live, walletBalance: live, availableBalance: live }
       : live;
 
+    const openPartialRealized = Array.from(this.openPositions.values())
+      .reduce((acc, p) => acc + (p.partialRealizedUSD ?? 0), 0);
     const realizedPnL = parseFloat(
-      this.closedTrades.reduce((acc, t) => acc + t.realizedPnLUSD, 0).toFixed(4)
+      (this.closedTrades.reduce((acc, t) => acc + t.realizedPnLUSD, 0) + openPartialRealized).toFixed(4)
     );
     const unrealizedPnL = parseFloat(
       Array.from(this.openPositions.values())

@@ -57,6 +57,7 @@ export class ExecutionEngine {
   };
 
   public onTradeUpdate: ((trade: Trade) => void) | null = null;
+  public onPartialProfit: ((trade: Trade, bankedRaw: number, bankedR: number, breakevenPrice: number) => void) | null = null;
 
   constructor(exchange: Exchange, config: BotConfig, logger: BotLogger) {
     this.exchange = exchange;
@@ -161,6 +162,10 @@ export class ExecutionEngine {
       stopLoss: order.stopLoss,
       takeProfit: order.takeProfit,
       size: order.size,
+      originalSize: order.size,
+      originalStopLoss: order.stopLoss,
+      partialTaken: false,
+      isBreakeven: false,
       pnlRaw: null,
       pnlR: null,
       outcome: TradeOutcome.OPEN,
@@ -191,29 +196,99 @@ export class ExecutionEngine {
   }
 
   // ──────────────────────────────────────────────────────────
+  // Public: high-frequency live price progress monitor
+  // Evaluates partial profit taking & breakeven shifts every tick
+  // ──────────────────────────────────────────────────────────
+
+  async checkTradeProgress(currentPrice: number): Promise<void> {
+    if (this.state.openTrades.size === 0 || currentPrice <= 0) return;
+    this.ledger.updateMarkPrice(currentPrice);
+
+    for (const [, trade] of this.state.openTrades) {
+      const stopDistance = Math.abs(trade.entryPrice - (trade.originalStopLoss ?? trade.stopLoss));
+      if (stopDistance <= 0) continue;
+
+      const currentR = trade.direction === SignalDirection.LONG
+        ? (currentPrice - trade.entryPrice) / stopDistance
+        : (trade.entryPrice - currentPrice) / stopDistance;
+
+      // 1. Check aggressive early partial profit harvest
+      if (this.config.enableEarlyPartials && !trade.partialTaken && currentR >= (this.config.partialTPR ?? 0.5)) {
+        await this.harvestPartial(trade, currentPrice, currentR);
+      }
+
+      // 2. Check full Stop Loss or Take Profit exit against live price
+      if (trade.direction === SignalDirection.LONG) {
+        if (currentPrice <= trade.stopLoss) {
+          this.closeTrade(
+            trade,
+            trade.stopLoss,
+            trade.isBreakeven ? TradeOutcome.BREAKEVEN : TradeOutcome.LOSS,
+            Date.now(),
+            trade.isBreakeven ? "Stopped out at Breakeven" : "Hit Stop Loss"
+          );
+        } else if (currentPrice >= trade.takeProfit) {
+          this.closeTrade(trade, trade.takeProfit, TradeOutcome.WIN, Date.now(), "Hit Take Profit");
+        }
+      } else {
+        if (currentPrice >= trade.stopLoss) {
+          this.closeTrade(
+            trade,
+            trade.stopLoss,
+            trade.isBreakeven ? TradeOutcome.BREAKEVEN : TradeOutcome.LOSS,
+            Date.now(),
+            trade.isBreakeven ? "Stopped out at Breakeven" : "Hit Stop Loss"
+          );
+        } else if (currentPrice <= trade.takeProfit) {
+          this.closeTrade(trade, trade.takeProfit, TradeOutcome.WIN, Date.now(), "Hit Take Profit");
+        }
+      }
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────
   // Public: check open trades against latest candle
   // ──────────────────────────────────────────────────────────
 
-  checkOpenTrades(latestCandle: Candle): void {
+  async checkOpenTrades(latestCandle: Candle): Promise<void> {
     this.ledger.updateMarkPrice(latestCandle.close);
 
     for (const [, trade] of this.state.openTrades) {
       const { high, low } = latestCandle;
+      const stopDistance = Math.abs(trade.entryPrice - (trade.originalStopLoss ?? trade.stopLoss));
 
+      // 1. Check early partial take-profit breached by candle high/low
+      if (this.config.enableEarlyPartials && !trade.partialTaken && stopDistance > 0) {
+        const triggerR = this.config.partialTPR ?? 0.5;
+        const isPartialHit =
+          trade.direction === SignalDirection.LONG
+            ? (high - trade.entryPrice) / stopDistance >= triggerR
+            : (trade.entryPrice - low) / stopDistance >= triggerR;
+
+        if (isPartialHit) {
+          const harvestPrice =
+            trade.direction === SignalDirection.LONG
+              ? trade.entryPrice + stopDistance * triggerR
+              : trade.entryPrice - stopDistance * triggerR;
+          await this.harvestPartial(trade, harvestPrice, triggerR);
+        }
+      }
+
+      // 2. Check remaining position SL / TP
       let outcome: TradeOutcome | null = null;
       let exitPrice: number | null = null;
 
       if (trade.direction === SignalDirection.LONG) {
         if (low <= trade.stopLoss) {
-          outcome = TradeOutcome.LOSS;
+          outcome = trade.isBreakeven ? TradeOutcome.BREAKEVEN : TradeOutcome.LOSS;
           exitPrice = trade.stopLoss;
         } else if (high >= trade.takeProfit) {
           outcome = TradeOutcome.WIN;
           exitPrice = trade.takeProfit;
         }
       } else {
-        if (high >= trade.stopLoss) {
-          outcome = TradeOutcome.LOSS;
+        if (high <= trade.stopLoss) {
+          outcome = trade.isBreakeven ? TradeOutcome.BREAKEVEN : TradeOutcome.LOSS;
           exitPrice = trade.stopLoss;
         } else if (low <= trade.takeProfit) {
           outcome = TradeOutcome.WIN;
@@ -224,6 +299,131 @@ export class ExecutionEngine {
       if (outcome !== null && exitPrice !== null) {
         this.closeTrade(trade, exitPrice, outcome, latestCandle.timestamp);
       }
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Private: harvest early partial profit & move SL to breakeven
+  // ──────────────────────────────────────────────────────────
+
+  async harvestPartial(trade: Trade, currentPrice: number, currentR: number): Promise<void> {
+    try {
+      const stopDistance = Math.abs(trade.entryPrice - (trade.originalStopLoss ?? trade.stopLoss));
+      const closePct = this.config.partialClosePct ?? 0.5;
+      const rawCloseSize = trade.size * closePct;
+      let closeSize = rawCloseSize;
+
+      if (this.exchange.markets?.[trade.symbol]) {
+        closeSize = parseFloat(this.exchange.amountToPrecision(trade.symbol, rawCloseSize));
+      }
+      if (closeSize <= 0 || closeSize >= trade.size) {
+        closeSize = parseFloat((trade.size * 0.5).toFixed(8));
+      }
+
+      // If live trading on Bybit, place reduce-only market order
+      const hasApiKey = Boolean(this.exchange.apiKey && this.exchange.apiKey.trim().length > 5);
+      if (hasApiKey && !this.config.paperTrading) {
+        const side = trade.direction === SignalDirection.LONG ? "sell" : "buy";
+        try {
+          this.logger.info("[Engine] Executing early partial close on Bybit", {
+            symbol: trade.symbol,
+            side,
+            size: closeSize,
+            triggerR: currentR.toFixed(2),
+          });
+          const resp = await this.exchange.createOrder(
+            trade.symbol,
+            "market",
+            side,
+            closeSize,
+            undefined,
+            { reduceOnly: true }
+          );
+          this.logger.info("[Engine] Bybit early partial filled", { orderId: resp.id, closeSize });
+        } catch (orderErr) {
+          this.logger.error("[Engine] Bybit early partial close failed", { error: String(orderErr) });
+        }
+      }
+
+      // Banked PnL calculations
+      const bankedRaw =
+        trade.direction === SignalDirection.LONG
+          ? (currentPrice - trade.entryPrice) * closeSize
+          : (trade.entryPrice - currentPrice) * closeSize;
+      const bankedR = stopDistance > 0 ? bankedRaw / (stopDistance * closeSize) : currentR;
+
+      // Calculate breakeven price with fee buffer
+      const feeBuffer = stopDistance * (this.config.breakevenBufferR ?? 0.05);
+      let bePrice =
+        trade.direction === SignalDirection.LONG
+          ? trade.entryPrice + feeBuffer
+          : trade.entryPrice - feeBuffer;
+      if (this.exchange.markets?.[trade.symbol]) {
+        bePrice = parseFloat(this.exchange.priceToPrecision(trade.symbol, bePrice));
+      }
+
+      // Update position stop loss on Bybit
+      if (hasApiKey && !this.config.paperTrading) {
+        try {
+          const marketId = (this.exchange.market(trade.symbol)?.id ?? trade.symbol.replace("/", "").split(":")[0]).replace(/[^a-zA-Z0-9]/g, "");
+          if (typeof (this.exchange as any).privatePostV5PositionTradingStop === "function") {
+            await (this.exchange as any).privatePostV5PositionTradingStop({
+              category: "linear",
+              symbol: marketId,
+              stopLoss: bePrice.toString(),
+              slTriggerBy: "LastPrice",
+              tpslMode: "Full",
+              positionIdx: 0,
+            });
+            this.logger.info("[Engine] Shifted Stop Loss to Breakeven on Bybit position", {
+              symbol: marketId,
+              bePrice,
+            });
+          }
+        } catch (stopErr) {
+          this.logger.warn("[Engine] Could not shift position stop loss on Bybit via privatePostV5PositionTradingStop", {
+            error: String(stopErr),
+          });
+        }
+      }
+
+      // Update trade state
+      trade.partialTaken = true;
+      trade.partialExitPrice = currentPrice;
+      trade.partialSize = closeSize;
+      trade.partialPnlRaw = parseFloat(bankedRaw.toFixed(4));
+      trade.partialPnlR = parseFloat(bankedR.toFixed(3));
+      trade.size = parseFloat((trade.size - closeSize).toFixed(8));
+      trade.stopLoss = bePrice;
+      trade.order.stopLoss = bePrice;
+      trade.isBreakeven = true;
+
+      // Record in ledger
+      this.ledger.recordPartialClose(trade, closeSize, currentPrice, bankedRaw, bankedR, bePrice);
+
+      this.logger.info("🎯 [Engine] EARLY PARTIAL HARVESTED & SL SHIFTED TO BREAKEVEN", {
+        id: trade.id.slice(0, 8),
+        symbol: trade.symbol,
+        bankedUSD: bankedRaw.toFixed(4),
+        bankedR: bankedR.toFixed(2),
+        newStopLoss: bePrice,
+        remainingSize: trade.size,
+      });
+
+      console.log("\n═════════════════════════════════════════════════════");
+      console.log("       🎯 EARLY PARTIAL PROFIT HARVESTED            ");
+      console.log("═════════════════════════════════════════════════════");
+      console.log(`Symbol       : ${trade.symbol}`);
+      console.log(`Harvest Price: ${currentPrice}`);
+      console.log(`Banked PnL   : +$${bankedRaw.toFixed(2)} (+${bankedR.toFixed(2)}R)`);
+      console.log(`Remaining Pos: ${trade.size}`);
+      console.log(`New Stop Loss: ${bePrice} (Breakeven + Fee Buffer)`);
+      console.log("Trade State  : 100% RISK-FREE 🛡️");
+      console.log("═════════════════════════════════════════════════════\n");
+
+      this.onPartialProfit?.(trade, bankedRaw, bankedR, bePrice);
+    } catch (err) {
+      this.logger.error("[Engine] Error in harvestPartial", { error: String(err) });
     }
   }
 
@@ -409,23 +609,33 @@ export class ExecutionEngine {
     closedAt: number,
     notes?: string
   ): void {
-    const stopDistance = Math.abs(trade.entryPrice - trade.stopLoss);
-    const pnlRaw =
+    const originalStopDist = Math.abs(trade.entryPrice - (trade.originalStopLoss ?? trade.stopLoss));
+    const remainingPnL =
       trade.direction === SignalDirection.LONG
         ? (exitPrice - trade.entryPrice) * trade.size
         : (trade.entryPrice - exitPrice) * trade.size;
 
-    const pnlR = stopDistance > 0 ? pnlRaw / (stopDistance * trade.size) : 0;
+    const totalPnlRaw = remainingPnL + (trade.partialPnlRaw ?? 0);
+    const initialRiskUSD = originalStopDist * (trade.originalSize ?? trade.size);
+    const totalPnlR = initialRiskUSD > 0 ? totalPnlRaw / initialRiskUSD : 0;
+
+    // If trade took partial profits and stopped out at breakeven, count as WIN or BREAKEVEN
+    let finalOutcome = outcome;
+    if (trade.partialTaken && (outcome === TradeOutcome.LOSS || outcome === TradeOutcome.BREAKEVEN)) {
+      finalOutcome = totalPnlRaw > 0 ? TradeOutcome.WIN : TradeOutcome.BREAKEVEN;
+    }
 
     const closed: Trade = {
       ...trade,
       exitPrice,
-      pnlRaw: parseFloat(pnlRaw.toFixed(8)),
-      pnlR: parseFloat(pnlR.toFixed(3)),
-      outcome,
+      pnlRaw: parseFloat(totalPnlRaw.toFixed(8)),
+      pnlR: parseFloat(totalPnlR.toFixed(3)),
+      outcome: finalOutcome,
       closedAt,
       durationMs: closedAt - trade.openedAt,
-      notes: notes ? `${trade.notes} | ${notes}` : trade.notes,
+      notes: trade.partialTaken
+        ? `${trade.notes} | Partial: +$${trade.partialPnlRaw?.toFixed(2)} (${trade.partialPnlR?.toFixed(2)}R) | Runner: $${remainingPnL.toFixed(2)} | Total: $${totalPnlRaw.toFixed(2)}`
+        : (notes ? `${trade.notes} | ${notes}` : trade.notes),
     };
 
     this.state.openTrades.delete(trade.id);
@@ -435,8 +645,8 @@ export class ExecutionEngine {
 
     this.logger.info("[Engine] Trade CLOSED", {
       id: closed.id.slice(0, 8),
-      outcome,
-      pnl: `${pnlRaw.toFixed(4)} (${pnlR.toFixed(2)}R)`,
+      outcome: finalOutcome,
+      pnl: `${totalPnlRaw.toFixed(4)} (${totalPnlR.toFixed(2)}R)`,
       exit: exitPrice,
     });
   }
@@ -745,6 +955,10 @@ export class ExecutionEngine {
         stopLoss: sl,
         takeProfit: tp,
         size: rawSize,
+        originalSize: rawSize,
+        originalStopLoss: sl,
+        partialTaken: false,
+        isBreakeven: false,
         pnlRaw: null,
         pnlR: null,
         outcome: TradeOutcome.OPEN,

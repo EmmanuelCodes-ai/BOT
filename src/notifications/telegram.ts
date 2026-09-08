@@ -104,6 +104,34 @@ export class TelegramNotifier {
     sendMessage(this.token, this.chatId, msg);
   }
 
+  notifyPartialHarvest(params: {
+    id: string;
+    symbol: string;
+    direction: string;
+    harvestPrice: number;
+    bankedPnlRaw: number;
+    bankedPnlR: number;
+    remainingSize: number;
+    breakevenPrice: number;
+    strategy: string;
+  }): void {
+    if (!this.enabled) return;
+
+    const pnlSign = params.bankedPnlRaw >= 0 ? "+" : "";
+    const msg =
+      `🎯 <b>EARLY PARTIAL PROFIT HARVESTED (${pnlSign}${params.bankedPnlR.toFixed(2)}R)</b>\n\n` +
+      `Strategy     : ${params.strategy}\n` +
+      `Symbol       : ${params.symbol} (${params.direction})\n` +
+      `Harvest Price: ${params.harvestPrice} (Market Fill)\n` +
+      `Banked Cash  : <b>${pnlSign}$${params.bankedPnlRaw.toFixed(4)}</b> (${pnlSign}${params.bankedPnlR.toFixed(2)}R)\n` +
+      `Remaining Pos: ${params.remainingSize}\n` +
+      `🛡️ Stop Loss : <b>${params.breakevenPrice}</b> (Moved to Breakeven + Fee Buffer)\n\n` +
+      `Status       : <b>100% RISK-FREE TRADE 🛡️</b>\n` +
+      `Bot ID       : ${params.id.slice(0, 8)}`;
+
+    sendMessage(this.token, this.chatId, msg);
+  }
+
   notifyTradeClose(params: {
     id: string;
     exchangeOrderId?: string | null;
@@ -114,12 +142,14 @@ export class TelegramNotifier {
     strategy: string;
     durationMin: number;
     isTest?: boolean;
+    partialPnlRaw?: number;
+    partialPnlR?: number;
   }): void {
     if (!this.enabled) return;
 
     const emoji =
       params.outcome === "WIN" ? "✅" :
-      params.outcome === "LOSS" ? "❌" : "⚪";
+      params.outcome === "LOSS" ? "❌" : "🛡️";
 
     const pnlSign = params.pnlRaw >= 0 ? "+" : "";
     const rawId = params.exchangeOrderId ?? "";
@@ -129,11 +159,17 @@ export class TelegramNotifier {
       ? `🧪 <b>MANUAL TEST TRADE CLOSED — ${params.outcome}</b>`
       : `${emoji} <b>AUTOMATED STRATEGY TRADE CLOSED — ${params.outcome}</b>`;
 
+    let partialInfo = "";
+    if (params.partialPnlRaw !== undefined && params.partialPnlRaw > 0) {
+      partialInfo = `Partials Banked: +$${params.partialPnlRaw.toFixed(4)} (+${(params.partialPnlR ?? 0).toFixed(2)}R)\n`;
+    }
+
     const msg =
       `${header}\n\n` +
       `Strategy  : ${params.strategy}\n` +
       `Exit      : ${params.exitPrice} (Bybit API Fill)\n` +
-      `PnL       : ${pnlSign}${params.pnlRaw.toFixed(4)} (${pnlSign}${params.pnlR.toFixed(2)}R)\n` +
+      partialInfo +
+      `Total PnL : ${pnlSign}${params.pnlRaw.toFixed(4)} (${pnlSign}${params.pnlR.toFixed(2)}R)\n` +
       `Duration  : ${params.durationMin}m\n\n` +
       `Order ID  : <code>${bybitOrderId}</code> (Order History)\n` +
       `Full UUID : <code>${rawId || "—"}</code>\n` +

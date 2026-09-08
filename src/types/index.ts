@@ -184,6 +184,14 @@ export interface Trade {
   stopLoss: number;
   takeProfit: number;
   size: number;
+  originalSize: number;
+  originalStopLoss: number;
+  partialTaken: boolean;
+  partialExitPrice?: number;
+  partialSize?: number;
+  partialPnlRaw?: number;
+  partialPnlR?: number;
+  isBreakeven: boolean;
   pnlRaw: number | null;      // raw PnL in quote currency
   pnlR: number | null;        // PnL expressed in R multiples
   outcome: TradeOutcome;
@@ -230,4 +238,8 @@ export interface BotConfig {
   maxOpenTrades: number;
   paperTrading: boolean;
   paperBalance: number;       // virtual account size for paper trading sizing
+  enableEarlyPartials: boolean;
+  partialTPR: number;          // e.g. 0.5 for +0.5R early take-profit
+  partialClosePct: number;     // e.g. 0.5 to close 50% size
+  breakevenBufferR: number;    // e.g. 0.05R to cover exchange fees
 }

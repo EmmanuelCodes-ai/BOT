@@ -71,6 +71,10 @@ function loadConfig(): BotConfig {
     maxOpenTrades: parseInt(process.env.MAX_OPEN_TRADES ?? "2", 10),
     paperTrading: process.env.PAPER_TRADING !== "false",
     paperBalance: parseFloat(process.env.PAPER_BALANCE ?? "10000"),
+    enableEarlyPartials: process.env.ENABLE_EARLY_PARTIALS !== "false",
+    partialTPR: parseFloat(process.env.PARTIAL_TP_R ?? "0.5"),
+    partialClosePct: parseFloat(process.env.PARTIAL_CLOSE_PCT ?? "0.5"),
+    breakevenBufferR: parseFloat(process.env.BREAKEVEN_BUFFER_R ?? "0.05"),
   };
 }
 
@@ -265,6 +269,8 @@ class TradingBot {
           strategy: trade.strategyId,
           durationMin: Math.round((trade.durationMs ?? 0) / 60000),
           isTest,
+          partialPnlRaw: trade.partialPnlRaw ?? undefined,
+          partialPnlR: trade.partialPnlR ?? undefined,
         });
 
         // Gemini proactive analysis on trade close
@@ -276,6 +282,27 @@ class TradingBot {
             }
           }).catch(() => {});
         }
+      }
+    };
+
+    // Wire early partial profit harvesting to telegram & AI analyst
+    this.engine.onPartialProfit = (trade, bankedRaw, bankedR, breakevenPrice) => {
+      this.telegram.notifyPartialHarvest({
+        id: trade.id,
+        symbol: trade.symbol,
+        direction: trade.direction,
+        harvestPrice: trade.partialExitPrice ?? trade.entryPrice,
+        bankedPnlRaw: bankedRaw,
+        bankedPnlR: bankedR,
+        remainingSize: trade.size,
+        breakevenPrice,
+        strategy: trade.strategyId,
+      });
+
+      if (this.analyst.isEnabled()) {
+        this.telegram.notifyAnalyst(
+          `🛡️ <b>Risk-Free Milestone Reached:</b> Early partial profit of +$${bankedRaw.toFixed(2)} (+${bankedR.toFixed(2)}R) secured on ${trade.symbol}. Stop Loss shifted to breakeven (${breakevenPrice}). Remaining position is now running 100% risk-free!`
+        );
       }
     };
   }
@@ -432,6 +459,19 @@ class TradingBot {
       await this.fireDailySummary();
     }
 
+    // ── Check open trades on live ticker / mark price (runs every 15s) ──
+    if (this.engine.getOpenTradeCount() > 0) {
+      try {
+        const ticker = await this.exchange.fetchTicker(this.config.symbol);
+        const currentPrice = ticker.last ?? ticker.close ?? 0;
+        if (currentPrice > 0) {
+          await this.engine.checkTradeProgress(currentPrice);
+        }
+      } catch (tickerErr) {
+        this.logger.debug("[Main] Ticker fetch for open trades error", { error: String(tickerErr) });
+      }
+    }
+
     // ── Fetch M5 candles (300 ≈ 25 hours) ─────────────────
     const m5Candles = await fetchClosedCandles(
       this.exchange,
@@ -471,7 +511,7 @@ class TradingBot {
     );
 
     // ── Check open trades for SL/TP hits ──────────────────
-    this.engine.checkOpenTrades(latestCandle);
+    await this.engine.checkOpenTrades(latestCandle);
 
     // ── Run flow classifier ────────────────────────────────
     const output = this.classifier.classify(
