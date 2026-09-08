@@ -543,6 +543,34 @@ export class ExecutionEngine {
       order.stopLoss = actualStopLoss;
       order.takeProfit = actualTakeProfit;
 
+      // Query Bybit for Tran ID (Trade History) and TP/SL IDs (Current Orders)
+      try {
+        const openOrders: any[] = await this.exchange.fetchOpenOrders(signal.symbol);
+        for (const o of openOrders) {
+          const id8 = (o.id ?? "").slice(-8);
+          if (o.info?.stopOrderType === "TakeProfit" || (o.takeProfit && o.takeProfit > 0) || o.info?.orderType === "TakeProfit") {
+            order.bybitTpId = id8;
+          } else if (o.info?.stopOrderType === "StopLoss" || (o.stopLoss && o.stopLoss > 0) || o.info?.orderType === "StopLoss") {
+            order.bybitSlId = id8;
+          }
+        }
+        if (!order.bybitTpId && !order.bybitSlId && openOrders.length > 0) {
+          const ids = openOrders.map((o) => (o.id ?? "").slice(-8));
+          if (ids[0]) order.bybitTpId = ids[0];
+          if (ids[1]) order.bybitSlId = ids[1];
+        }
+
+        const myTrades = await this.exchange.fetchMyTrades(signal.symbol, undefined, 2);
+        if (myTrades.length > 0) {
+          const matchTrade = myTrades.find((t) => t.order === entryResp.id) ?? myTrades[myTrades.length - 1];
+          if (matchTrade) {
+            order.bybitTranId = (matchTrade.id ?? (matchTrade.info as any)?.execId ?? "").slice(-8);
+          }
+        }
+      } catch (fErr) {
+        // non-fatal
+      }
+
       const rawOrderId = (entryResp.info as any)?.orderId ?? entryResp.id;
       const rawOrderLinkId = (entryResp.info as any)?.orderLinkId;
 
@@ -550,8 +578,9 @@ export class ExecutionEngine {
       console.log("             BYBIT LIVE ORDER PLACED                 ");
       console.log("═════════════════════════════════════════════════════");
       console.log("CCXT entryResp.id  :", entryResp.id);
-      console.log("Bybit orderId      :", rawOrderId);
-      console.log("Bybit orderLinkId  :", rawOrderLinkId);
+      console.log("Order ID (slice-8) :", (rawOrderId ?? "").slice(-8));
+      console.log("Tran ID            :", order.bybitTranId ?? "—");
+      console.log("TP / SL Order IDs  :", `${order.bybitTpId ?? "—"} / ${order.bybitSlId ?? "—"}`);
       console.log("Fill Price (Bybit) :", order.entryPrice);
       console.log("Filled Size (Bybit):", order.size);
       console.log("Full Bybit response:", JSON.stringify(entryResp.info ?? entryResp, null, 2));
@@ -559,8 +588,10 @@ export class ExecutionEngine {
 
       this.logger.info("[Engine] Live order placed", {
         entryOrderId: entryResp.id,
-        bybitOrderId: rawOrderId,
-        bybitOrderLinkId: rawOrderLinkId,
+        bybitOrderId: (rawOrderId ?? "").slice(-8),
+        tranId: order.bybitTranId,
+        tpId: order.bybitTpId,
+        slId: order.bybitSlId,
         fillPrice: order.entryPrice,
         size: order.size,
         sl: order.stopLoss,
@@ -608,6 +639,9 @@ export class ExecutionEngine {
 
       // 4. Place the order (paper or live)
       let exchangeOrderId: string | null = null;
+      let bybitTranId: string | undefined;
+      let bybitTpId: string | undefined;
+      let bybitSlId: string | undefined;
 
       const hasApiKey = Boolean(this.exchange.apiKey && this.exchange.apiKey.trim().length > 5);
 
@@ -648,6 +682,33 @@ export class ExecutionEngine {
           this.logger.warn("[Engine] Could not fetch filled order details for test trade", { error: String(fErr) });
         }
 
+        try {
+          const openOrders: any[] = await this.exchange.fetchOpenOrders(this.config.symbol);
+          for (const o of openOrders) {
+            const id8 = (o.id ?? "").slice(-8);
+            if (o.info?.stopOrderType === "TakeProfit" || (o.takeProfit && o.takeProfit > 0) || o.info?.orderType === "TakeProfit") {
+              bybitTpId = id8;
+            } else if (o.info?.stopOrderType === "StopLoss" || (o.stopLoss && o.stopLoss > 0) || o.info?.orderType === "StopLoss") {
+              bybitSlId = id8;
+            }
+          }
+          if (!bybitTpId && !bybitSlId && openOrders.length > 0) {
+            const ids = openOrders.map((o) => (o.id ?? "").slice(-8));
+            if (ids[0]) bybitTpId = ids[0];
+            if (ids[1]) bybitSlId = ids[1];
+          }
+
+          const myTrades = await this.exchange.fetchMyTrades(this.config.symbol, undefined, 2);
+          if (myTrades.length > 0) {
+            const matchTrade = myTrades.find((t: any) => t.order === resp.id) ?? myTrades[myTrades.length - 1];
+            if (matchTrade) {
+              bybitTranId = (matchTrade.id ?? (matchTrade.info as any)?.execId ?? "").slice(-8);
+            }
+          }
+        } catch (fErr) {
+          // non-fatal
+        }
+
         const rawOrderId = (resp.info as any)?.orderId ?? resp.id;
         const rawOrderLinkId = (resp.info as any)?.orderLinkId;
 
@@ -655,8 +716,9 @@ export class ExecutionEngine {
         console.log("             BYBIT TEST TRADE PLACED                 ");
         console.log("═════════════════════════════════════════════════════");
         console.log("CCXT resp.id       :", resp.id);
-        console.log("Bybit orderId      :", rawOrderId);
-        console.log("Bybit orderLinkId  :", rawOrderLinkId);
+        console.log("Order ID (slice-8) :", (rawOrderId ?? "").slice(-8));
+        console.log("Tran ID            :", bybitTranId ?? "—");
+        console.log("TP / SL Order IDs  :", `${bybitTpId ?? "—"} / ${bybitSlId ?? "—"}`);
         console.log("Fill Price (Bybit) :", price);
         console.log("Filled Size (Bybit):", rawSize);
         console.log("Full Bybit response:", JSON.stringify(resp.info ?? resp, null, 2));
@@ -664,8 +726,10 @@ export class ExecutionEngine {
 
         this.logger.info("[Engine] Test trade placed on Bybit", {
           orderId: exchangeOrderId,
-          bybitOrderId: rawOrderId,
-          bybitOrderLinkId: rawOrderLinkId,
+          bybitOrderId: (rawOrderId ?? "").slice(-8),
+          tranId: bybitTranId,
+          tpId: bybitTpId,
+          slId: bybitSlId,
           fillPrice: price,
           size: rawSize,
         });
@@ -686,6 +750,9 @@ export class ExecutionEngine {
         placedAt: now,
         filledAt: now,
         closedAt: null,
+        bybitTranId,
+        bybitTpId,
+        bybitSlId,
       };
 
       const trade: Trade = {

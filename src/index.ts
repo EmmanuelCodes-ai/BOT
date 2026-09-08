@@ -241,6 +241,9 @@ class TradingBot {
           flow: trade.flow.flow,
           score,
           isTest,
+          tranId: trade.order.bybitTranId,
+          tpOrderId: trade.order.bybitTpId,
+          slOrderId: trade.order.bybitSlId,
         });
 
         // Gemini proactive analysis on trade open
@@ -319,13 +322,20 @@ class TradingBot {
           const trade = await this.engine.placeTestTrade();
           if (trade) {
             const rawId = trade.order.exchangeOrderId ?? "PAPER";
-            console.log(`[Command] Test trade executed successfully! Bybit order ID: ${rawId}`);
+            const orderId8 = rawId.startsWith("PAPER") ? "PAPER" : rawId.slice(-8);
+            console.log(`[Command] Test trade executed successfully! Bybit order ID: ${rawId} (${orderId8})`);
+            let extra = "";
+            if (trade.order.bybitTranId) extra += `\nTran ID   : <code>${trade.order.bybitTranId}</code> (Trade History)`;
+            if (trade.order.bybitTpId || trade.order.bybitSlId) {
+              extra += `\nTP/SL IDs : <code>${[trade.order.bybitTpId, trade.order.bybitSlId].filter(Boolean).join(" / ")}</code> (TP/SL tab)`;
+            }
             await this.poller!.sendMessage(
               id,
               `✅ <b>Test trade placed on Bybit!</b>\n\n` +
-              `Bybit ID (8-char) : <code>${rawId.slice(0, 8)}</code>\n` +
-              `Full Order ID     : <code>${rawId}</code>\n\n` +
-              `Check your Bybit open positions / order history and Railway logs to verify.`
+              `Order ID  : <code>${orderId8}</code> (Order History)\n` +
+              `Full UUID : <code>${rawId}</code>` +
+              extra +
+              `\n\nCheck your Bybit Order History tab — it matches <code>${orderId8}</code> exactly!`
             );
           } else {
             console.error(`[Command] /testtrade failed! Check above in Railway logs for the exact error from Bybit.`);

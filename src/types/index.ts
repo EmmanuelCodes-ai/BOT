@@ -167,6 +167,9 @@ export interface Order {
   placedAt: number;           // Unix ms
   filledAt: number | null;
   closedAt: number | null;
+  bybitTranId?: string;       // Tran ID (Bybit Trade History)
+  bybitTpId?: string;         // TP conditional Order ID (Bybit TP/SL tab)
+  bybitSlId?: string;         // SL conditional Order ID (Bybit TP/SL tab)
 }
 
 export interface Trade {

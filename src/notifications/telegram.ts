@@ -68,31 +68,42 @@ export class TelegramNotifier {
     flow: string;
     score: number;
     isTest?: boolean;
+    tranId?: string;
+    tpOrderId?: string;
+    slOrderId?: string;
   }): void {
     if (!this.enabled) return;
 
     const emoji = params.direction === "LONG" ? "🟢" : "🔴";
     const rawId = params.exchangeOrderId ?? "";
-    const bybitId = rawId.startsWith("PAPER") ? "PAPER" : (rawId.slice(0, 8) || "—");
+    const bybitOrderId = rawId.startsWith("PAPER") ? "PAPER" : (rawId.slice(-8) || "—");
 
     const header = params.isTest
       ? `🧪 <b>MANUAL TEST TRADE OPENED</b>\n<i>(Triggered manually via /testtrade)</i>`
       : `${emoji} <b>AUTOMATED STRATEGY TRADE OPENED</b>\n<i>(Triggered automatically by strategy signal)</i>`;
 
+    let ids = `Order ID  : <code>${bybitOrderId}</code> (Order History)\n`;
+    if (params.tranId) {
+      ids += `Tran ID   : <code>${params.tranId}</code> (Trade History)\n`;
+    }
+    if (params.tpOrderId || params.slOrderId) {
+      ids += `TP/SL IDs : <code>${[params.tpOrderId, params.slOrderId].filter(Boolean).join(" / ")}</code> (TP/SL tab)\n`;
+    }
+    ids += `Full UUID : <code>${rawId || "—"}</code>`;
+
     const msg =
       `${header}\n\n` +
-      `Strategy : ${params.strategy}\n` +
-      `Direction: ${params.direction}\n` +
-      `Symbol   : ${params.symbol}\n` +
-      `Entry    : ${params.entry} (Bybit API Fill)\n` +
-      `Stop Loss: ${params.stopLoss}\n` +
+      `Strategy  : ${params.strategy}\n` +
+      `Direction : ${params.direction}\n` +
+      `Symbol    : ${params.symbol}\n` +
+      `Entry     : ${params.entry} (Bybit API Fill)\n` +
+      `Stop Loss : ${params.stopLoss}\n` +
       `Take Profit: ${params.takeProfit}\n` +
-      `Size     : ${params.size}\n` +
-      `Flow     : ${params.flow}\n` +
-      `Score    : ${params.score}\n` +
-      `Bybit ID : <code>${bybitId}</code>\n` +
-      `Full ID  : <code>${rawId || "—"}</code>\n` +
-      `Bot ID   : ${params.id.slice(0, 8)}`;
+      `Size      : ${params.size}\n` +
+      `Flow      : ${params.flow}\n` +
+      `Score     : ${params.score}\n\n` +
+      ids + `\n` +
+      `Bot ID    : ${params.id.slice(0, 8)}`;
 
     sendMessage(this.token, this.chatId, msg);
   }
@@ -116,7 +127,7 @@ export class TelegramNotifier {
 
     const pnlSign = params.pnlRaw >= 0 ? "+" : "";
     const rawId = params.exchangeOrderId ?? "";
-    const bybitId = rawId.startsWith("PAPER") ? "PAPER" : (rawId.slice(0, 8) || "—");
+    const bybitOrderId = rawId.startsWith("PAPER") ? "PAPER" : (rawId.slice(-8) || "—");
 
     const header = params.isTest
       ? `🧪 <b>MANUAL TEST TRADE CLOSED — ${params.outcome}</b>`
@@ -124,13 +135,13 @@ export class TelegramNotifier {
 
     const msg =
       `${header}\n\n` +
-      `Strategy : ${params.strategy}\n` +
-      `Exit     : ${params.exitPrice} (Bybit API Fill)\n` +
-      `PnL      : ${pnlSign}${params.pnlRaw.toFixed(4)} (${pnlSign}${params.pnlR.toFixed(2)}R)\n` +
-      `Duration : ${params.durationMin}m\n` +
-      `Bybit ID : <code>${bybitId}</code>\n` +
-      `Full ID  : <code>${rawId || "—"}</code>\n` +
-      `Bot ID   : ${params.id.slice(0, 8)}`;
+      `Strategy  : ${params.strategy}\n` +
+      `Exit      : ${params.exitPrice} (Bybit API Fill)\n` +
+      `PnL       : ${pnlSign}${params.pnlRaw.toFixed(4)} (${pnlSign}${params.pnlR.toFixed(2)}R)\n` +
+      `Duration  : ${params.durationMin}m\n\n` +
+      `Order ID  : <code>${bybitOrderId}</code> (Order History)\n` +
+      `Full UUID : <code>${rawId || "—"}</code>\n` +
+      `Bot ID    : ${params.id.slice(0, 8)}`;
 
     sendMessage(this.token, this.chatId, msg);
   }
