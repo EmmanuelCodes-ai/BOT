@@ -18,6 +18,7 @@ import { v4 as uuidv4 } from "uuid";
 import {
   Signal,
   SignalDirection,
+  StrategyId,
   Order,
   OrderStatus,
   Trade,
@@ -527,6 +528,110 @@ export class ExecutionEngine {
     }
 
     return order;
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Public: place a real minimal test trade (for /testtrade)
+  // Places the smallest valid market order with SL/TP on Bybit
+  // so the user can verify the Bybit order ID matches Telegram.
+  // ──────────────────────────────────────────────────────────
+
+  async placeTestTrade(): Promise<Trade | null> {
+    try {
+      // 1. Get current price
+      const ticker = await this.exchange.fetchTicker(this.config.symbol);
+      const price = ticker.last ?? ticker.close ?? 0;
+      if (price <= 0) throw new Error("Could not fetch current price");
+
+      // 2. Use minimum allowed size for BTC/USDT:USDT on Bybit (0.001 BTC)
+      const market = this.exchange.markets?.[this.config.symbol];
+      const minSize = market?.limits?.amount?.min ?? 0.001;
+      const rawSize = parseFloat(
+        this.exchange.amountToPrecision(this.config.symbol, minSize)
+      );
+
+      // 3. Tight SL/TP — 0.5% away (minimum to pass Bybit validation)
+      const sl = parseFloat(
+        this.exchange.priceToPrecision(this.config.symbol, price * 0.995)
+      );
+      const tp = parseFloat(
+        this.exchange.priceToPrecision(this.config.symbol, price * 1.005)
+      );
+
+      this.logger.info("[Engine] Placing test trade", { price, size: rawSize, sl, tp });
+
+      // 4. Place the order (paper or live)
+      let exchangeOrderId: string | null = null;
+
+      if (this.config.paperTrading) {
+        exchangeOrderId = `PAPER-${uuidv4().slice(0, 8)}`;
+      } else {
+        const resp = await this.exchange.createOrder(
+          this.config.symbol,
+          "market",
+          "buy",
+          rawSize,
+          undefined,
+          {
+            stopLoss: sl,
+            takeProfit: tp,
+            slTriggerBy: "LastPrice",
+            tpTriggerBy: "LastPrice",
+          }
+        );
+        exchangeOrderId = resp.id;
+        this.logger.info("[Engine] Test trade placed on Bybit", { orderId: exchangeOrderId });
+      }
+
+      // 5. Build trade record and register in ledger/state
+      const now = Date.now();
+      const order: Order = {
+        id: uuidv4(),
+        exchangeOrderId,
+        symbol: this.config.symbol,
+        direction: SignalDirection.LONG,
+        size: rawSize,
+        entryPrice: price,
+        stopLoss: sl,
+        takeProfit: tp,
+        status: OrderStatus.FILLED,
+        placedAt: now,
+        filledAt: now,
+        closedAt: null,
+      };
+
+      const trade: Trade = {
+        id: uuidv4(),
+        signalId: "TEST",
+        order,
+        symbol: this.config.symbol,
+        strategyId: StrategyId.TREND_PULLBACK_EMA,
+        flow: { flow: "BULLISH", confidence: 1, h1Bias: "BULLISH", h4Bias: "BULLISH", macroBias: "BULLISH" } as any,
+        direction: SignalDirection.LONG,
+        entryPrice: price,
+        exitPrice: null,
+        stopLoss: sl,
+        takeProfit: tp,
+        size: rawSize,
+        pnlRaw: null,
+        pnlR: null,
+        outcome: TradeOutcome.OPEN,
+        openedAt: now,
+        closedAt: null,
+        durationMs: null,
+        indicators: null as any,
+        notes: "Strategy: TEST_TRADE | Flow: BULLISH | Score: 100",
+      };
+
+      this.state.openTrades.set(trade.id, trade);
+      this.ledger.recordOpen(trade, price);
+      this.onTradeUpdate?.(trade);
+
+      return trade;
+    } catch (err) {
+      this.logger.error("[Engine] Test trade failed", { error: String(err) });
+      return null;
+    }
   }
 
   // ──────────────────────────────────────────────────────────

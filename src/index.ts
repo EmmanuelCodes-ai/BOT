@@ -309,22 +309,18 @@ class TradingBot {
         this.logger.info(`[Command] ${fromName}: ${command}`);
 
         if (command === "/testtrade") {
-          // Fire a simulated trade notification to preview message format
-          const fakeBybitId = "fdaf7087"; // matches Bybit's 8-char format
-          this.telegram.notifyTradeOpen({
-            id: "test-" + Date.now().toString().slice(-8),
-            exchangeOrderId: fakeBybitId,
-            strategy: "TREND_PULLBACK_EMA",
-            direction: "LONG",
-            symbol: this.config.symbol,
-            entry: this.lastPrice || 57842.50,
-            stopLoss: parseFloat(((this.lastPrice || 57842.50) * 0.99).toFixed(2)),
-            takeProfit: parseFloat(((this.lastPrice || 57842.50) * 1.02).toFixed(2)),
-            size: 0.003,
-            flow: "BULLISH",
-            score: 74,
-          });
-          await this.poller!.sendMessage(id, "✅ Test trade notification sent! Check the message above.");
+          await this.poller!.sendMessage(id, "⏳ Placing test trade on Bybit — please wait...");
+          const trade = await this.engine.placeTestTrade();
+          if (trade) {
+            // The onTradeUpdate callback already fires notifyTradeOpen via the engine,
+            // but we also confirm directly to the command sender.
+            await this.poller!.sendMessage(
+              id,
+              `✅ Test trade placed!\nBybit ID: <code>${(trade.order.exchangeOrderId ?? "PAPER").slice(0, 8)}</code>\n\nCheck your Bybit positions and compare the ID above.`
+            );
+          } else {
+            await this.poller!.sendMessage(id, "❌ Test trade failed. Check Railway logs for details.");
+          }
 
         } else if (command === "/status") {
           const bal = this.engine.getLatestBalanceInfo();
