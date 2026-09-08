@@ -57,6 +57,7 @@ export class TelegramNotifier {
 
   notifyTradeOpen(params: {
     id: string;
+    exchangeOrderId: string | null;
     strategy: string;
     direction: string;
     symbol: string;
@@ -70,6 +71,8 @@ export class TelegramNotifier {
     if (!this.enabled) return;
 
     const emoji = params.direction === "LONG" ? "🟢" : "🔴";
+    const rawId = params.exchangeOrderId ?? "";
+    const bybitId = rawId.startsWith("PAPER") ? "PAPER" : (rawId.slice(0, 8) || "—");
     const msg =
       `${emoji} <b>TRADE OPENED</b>\n\n` +
       `Strategy : ${params.strategy}\n` +
@@ -81,13 +84,15 @@ export class TelegramNotifier {
       `Size     : ${params.size}\n` +
       `Flow     : ${params.flow}\n` +
       `Score    : ${params.score}\n` +
-      `ID       : ${params.id.slice(0, 8)}`;
+      `Bybit ID : <code>${bybitId}</code>\n` +
+      `Bot ID   : ${params.id.slice(0, 8)}`;
 
     sendMessage(this.token, this.chatId, msg);
   }
 
   notifyTradeClose(params: {
     id: string;
+    exchangeOrderId?: string | null;
     outcome: string;
     pnlRaw: number;
     pnlR: number;
@@ -102,6 +107,8 @@ export class TelegramNotifier {
       params.outcome === "LOSS" ? "❌" : "⚪";
 
     const pnlSign = params.pnlRaw >= 0 ? "+" : "";
+    const rawId = params.exchangeOrderId ?? "";
+    const bybitId = rawId.startsWith("PAPER") ? "PAPER" : (rawId.slice(0, 8) || "—");
 
     const msg =
       `${emoji} <b>TRADE CLOSED — ${params.outcome}</b>\n\n` +
@@ -109,7 +116,8 @@ export class TelegramNotifier {
       `Exit     : ${params.exitPrice}\n` +
       `PnL      : ${pnlSign}${params.pnlRaw.toFixed(4)} (${pnlSign}${params.pnlR.toFixed(2)}R)\n` +
       `Duration : ${params.durationMin}m\n` +
-      `ID       : ${params.id.slice(0, 8)}`;
+      `Bybit ID : <code>${bybitId}</code>\n` +
+      `Bot ID   : ${params.id.slice(0, 8)}`;
 
     sendMessage(this.token, this.chatId, msg);
   }
@@ -166,8 +174,13 @@ export class TelegramNotifier {
     );
   }
 
+  notifyAnalyst(message: string): void {
+    if (!this.enabled) return;
+    sendMessage(this.token, this.chatId, message);
+  }
+
   notifyError(message: string): void {
     if (!this.enabled) return;
-    sendMessage(this.token, this.chatId, `⚠️ <b>Bot Error</b>\n${message}`);
+    sendMessage(this.token, this.chatId, `⚠️ <b>Bot Alert</b>\n${message}`);
   }
 }

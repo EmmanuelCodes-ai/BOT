@@ -227,6 +227,7 @@ class TradingBot {
 
         this.telegram.notifyTradeOpen({
           id: trade.id,
+          exchangeOrderId: trade.order.exchangeOrderId,
           strategy: trade.strategyId,
           direction: trade.direction,
           symbol: trade.symbol,
@@ -243,13 +244,14 @@ class TradingBot {
           const ctx = this.buildContext();
           this.analyst.analyzeTradeOpen(trade, this.lastSignal, ctx).then((insight) => {
             if (insight) {
-              this.telegram.notifyError(`🤖 AI Analyst:\n\n${insight}`);
+              this.telegram.notifyAnalyst(`🤖 AI Analyst:\n\n${insight}`);
             }
           }).catch(() => {});
         }
       } else {
         this.telegram.notifyTradeClose({
           id: trade.id,
+          exchangeOrderId: trade.order.exchangeOrderId,
           outcome: trade.outcome,
           pnlRaw: trade.pnlRaw ?? 0,
           pnlR: trade.pnlR ?? 0,
@@ -263,7 +265,7 @@ class TradingBot {
           const ctx = this.buildContext();
           this.analyst.analyzeTradeClose(trade, ctx).then((insight) => {
             if (insight) {
-              this.telegram.notifyError(`🤖 AI Analyst:\n\n${insight}`);
+              this.telegram.notifyAnalyst(`🤖 AI Analyst:\n\n${insight}`);
             }
           }).catch(() => {});
         }
@@ -293,12 +295,68 @@ class TradingBot {
     const chatId = process.env.TELEGRAM_CHAT_ID ?? "";
     if (token && chatId && this.analyst.isEnabled()) {
       this.poller = new TelegramPoller(token, chatId);
+
+      // AI chat handler
       this.poller.setMessageHandler(async (id, text, fromName) => {
         this.logger.info(`[Chat] Message from ${fromName}: ${text}`);
         const ctx = this.buildContext();
         const reply = await this.analyst.chat(text, ctx);
         await this.poller!.sendMessage(id, `🤖 AI Analyst:\n\n${reply}`);
       });
+
+      // Slash command handler
+      this.poller.setCommandHandler(async (id, command, fromName) => {
+        this.logger.info(`[Command] ${fromName}: ${command}`);
+
+        if (command === "/testtrade") {
+          // Fire a simulated trade notification to preview message format
+          const fakeBybitId = "fdaf7087"; // matches Bybit's 8-char format
+          this.telegram.notifyTradeOpen({
+            id: "test-" + Date.now().toString().slice(-8),
+            exchangeOrderId: fakeBybitId,
+            strategy: "TREND_PULLBACK_EMA",
+            direction: "LONG",
+            symbol: this.config.symbol,
+            entry: this.lastPrice || 57842.50,
+            stopLoss: parseFloat(((this.lastPrice || 57842.50) * 0.99).toFixed(2)),
+            takeProfit: parseFloat(((this.lastPrice || 57842.50) * 1.02).toFixed(2)),
+            size: 0.003,
+            flow: "BULLISH",
+            score: 74,
+          });
+          await this.poller!.sendMessage(id, "✅ Test trade notification sent! Check the message above.");
+
+        } else if (command === "/status") {
+          const bal = this.engine.getLatestBalanceInfo();
+          const open = this.engine.getOpenTradeCount();
+          const ind = this.latestIndicators;
+          const msg =
+            `📊 <b>Bot Status</b>\n\n` +
+            `Symbol   : ${this.config.symbol}\n` +
+            `Price    : $${this.lastPrice || "—"}\n` +
+            `RSI(14)  : ${ind ? ind.rsi14.toFixed(1) : "—"}\n` +
+            `Equity   : $${bal.equity.toFixed(2)}\n` +
+            `Available: $${bal.availableBalance.toFixed(2)}\n` +
+            `Open Pos : ${open}`;
+          await this.poller!.sendMessage(id, msg);
+
+        } else if (command === "/help") {
+          await this.poller!.sendMessage(id,
+            `🤖 <b>Bot Commands</b>\n\n` +
+            `/testtrade — Preview trade notification format\n` +
+            `/status — Current price, balance & RSI\n` +
+            `/help — Show this menu\n\n` +
+            `Or just type any question to chat with the AI analyst.`
+          );
+
+        } else {
+          // Unknown command — fall through to AI
+          const ctx = this.buildContext();
+          const reply = await this.analyst.chat(command, ctx);
+          await this.poller!.sendMessage(id, `🤖 AI Analyst:\n\n${reply}`);
+        }
+      });
+
       this.poller.start();
     }
 
@@ -405,6 +463,11 @@ class TradingBot {
 
     this.logger.logEvaluation(evalRecord);
 
+    // ── Refresh live balance every tick for accurate AI context ──
+    this.engine.fetchLiveAccountBalance().catch(() => {
+      // non-fatal — engine keeps the last known balance
+    });
+
     // ── Save latest telemetry for AI context ───────────────
     this.latestCandles = m5Candles;
     this.lastPrice = latestCandle.close;
@@ -503,7 +566,7 @@ class TradingBot {
       const ctx = this.buildContext();
       this.analyst.analyzeDailySummary(ctx).then((insight) => {
         if (insight) {
-          this.telegram.notifyError(`🤖 AI Daily Analysis:\n\n${insight}`);
+          this.telegram.notifyAnalyst(`🤖 AI Daily Analysis:\n\n${insight}`);
         }
       }).catch(() => {});
     }

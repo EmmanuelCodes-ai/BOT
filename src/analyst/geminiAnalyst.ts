@@ -203,8 +203,8 @@ interface ChatMessage {
   content: string;
 }
 
-// ── HTTP request with SSE streaming support ─────────────────
-function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
+// ── Single HTTP attempt (SSE streaming) ─────────────────────
+function nimAttempt(messages: ChatMessage[], apiKey: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
       model: MODEL,
@@ -227,6 +227,13 @@ function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
     };
 
     const req = https.request(options, (res) => {
+      // Treat server-side overload codes as retryable errors
+      if (res.statusCode === 529 || res.statusCode === 503 || res.statusCode === 502) {
+        res.resume(); // drain response body
+        reject(new Error(`NIM_OVERLOAD:${res.statusCode}`));
+        return;
+      }
+
       let fullText = "";
       let rawBuffer = "";
 
@@ -270,6 +277,40 @@ function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
     req.write(body);
     req.end();
   });
+}
+
+// ── HTTP request with exponential-backoff retry ──────────────
+// Retries up to MAX_RETRIES times on overload/transient errors.
+// Delays: 5s → 10s → 20s → 40s
+const MAX_RETRIES = 4;
+const BASE_DELAY_MS = 5_000;
+
+async function nimRequest(messages: ChatMessage[], apiKey: string): Promise<string> {
+  let lastErr: Error = new Error("Unknown NIM error");
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      return await nimAttempt(messages, apiKey);
+    } catch (err: any) {
+      lastErr = err;
+      const isOverload =
+        String(err?.message ?? "").startsWith("NIM_OVERLOAD") ||
+        String(err?.message ?? "").toLowerCase().includes("overload") ||
+        String(err?.message ?? "").toLowerCase().includes("too many");
+
+      if (!isOverload || attempt === MAX_RETRIES - 1) {
+        throw err; // non-retryable or exhausted retries
+      }
+
+      const delayMs = BASE_DELAY_MS * Math.pow(2, attempt); // 5s, 10s, 20s
+      console.warn(
+        `[Analyst] Model overloaded (attempt ${attempt + 1}/${MAX_RETRIES}). Retrying in ${delayMs / 1000}s...`
+      );
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+
+  throw lastErr;
 }
 
 // ── Analyst class ───────────────────────────────────────────

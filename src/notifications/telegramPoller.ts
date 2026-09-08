@@ -74,12 +74,19 @@ export type MessageHandler = (
   fromName: string
 ) => Promise<void>;
 
+export type CommandHandler = (
+  chatId: number,
+  command: string,
+  fromName: string
+) => Promise<void>;
+
 export class TelegramPoller {
   private token: string;
   private allowedChatId: number;
   private lastUpdateId: number = 0;
   private running: boolean = false;
   private onMessage: MessageHandler | null = null;
+  private onCommand: CommandHandler | null = null;
 
   constructor(token: string, allowedChatId: string) {
     this.token = token;
@@ -88,6 +95,10 @@ export class TelegramPoller {
 
   setMessageHandler(handler: MessageHandler): void {
     this.onMessage = handler;
+  }
+
+  setCommandHandler(handler: CommandHandler): void {
+    this.onCommand = handler;
   }
 
   start(): void {
@@ -129,7 +140,12 @@ export class TelegramPoller {
             `[TelegramPoller] Message from ${fromName}: ${msg.text}`
           );
 
-          if (this.onMessage) {
+          // Route slash commands separately from AI chat
+          if (msg.text.startsWith("/") && this.onCommand) {
+            this.onCommand(msg.chat.id, msg.text.trim(), fromName).catch((err) =>
+              console.error("[TelegramPoller] Command error:", err)
+            );
+          } else if (this.onMessage) {
             // Don't await — handle async in background so poll continues
             this.onMessage(msg.chat.id, msg.text, fromName).catch((err) =>
               console.error("[TelegramPoller] Handler error:", err)
