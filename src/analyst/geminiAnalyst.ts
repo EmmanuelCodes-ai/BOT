@@ -203,11 +203,16 @@ interface ChatMessage {
   content: string;
 }
 
+interface KeyConfig {
+  key: string;
+  model: string;
+}
+
 // ── Single HTTP attempt (SSE streaming) ─────────────────────
-function nimAttempt(messages: ChatMessage[], apiKey: string): Promise<string> {
+function nimAttempt(messages: ChatMessage[], apiKey: string, model: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
-      model: MODEL,
+      model,
       messages,
       max_tokens: 2048,
       temperature: 0.7,
@@ -275,7 +280,7 @@ function nimAttempt(messages: ChatMessage[], apiKey: string): Promise<string> {
     // 25 second timeout for snappy response & fast failover
     req.setTimeout(25000, () => {
       req.destroy();
-      reject(new Error("NIM request timed out after 25s"));
+      reject(new Error(`NIM request timed out after 25s (${model})`));
     });
 
     req.write(body);
@@ -283,31 +288,36 @@ function nimAttempt(messages: ChatMessage[], apiKey: string): Promise<string> {
   });
 }
 
-// ── API key pool (rotation on rate-limit / timeout) ─────────
-function loadApiKeys(): string[] {
-  const keys: string[] = [];
+// ── API key & Model pool (multi-model failover) ─────────────
+function loadApiKeys(): KeyConfig[] {
+  const configs: KeyConfig[] = [];
   let i = 1;
   while (true) {
     const k = process.env[`NVIDIA_API_KEY_${i}`];
     if (!k) break;
-    keys.push(k);
+    // Model for this key: NVIDIA_MODEL_i, or fallback to default per slot
+    const defaultModel = i === 2 ? "deepseek-ai/deepseek-v4-pro-0813" : "moonshotai/kimi-k3";
+    const model = process.env[`NVIDIA_MODEL_${i}`] ?? process.env.NVIDIA_MODEL ?? defaultModel;
+    configs.push({ key: k, model });
     i++;
   }
   // Fall back to legacy single-key env var
-  if (keys.length === 0) {
+  if (configs.length === 0) {
     const legacy = process.env.NVIDIA_API_KEY ?? "";
-    if (legacy) keys.push(legacy);
+    if (legacy) {
+      configs.push({ key: legacy, model: process.env.NVIDIA_MODEL ?? "moonshotai/kimi-k3" });
+    }
   }
-  return keys;
+  return configs;
 }
 
-// ── HTTP request with key rotation + retry ───────────────────
+// ── HTTP request with key/model rotation + retry ─────────────
 const MAX_RETRIES_PER_KEY = 2;
 const BASE_DELAY_MS = 2_000;
 
 async function nimRequest(
   messages: ChatMessage[],
-  keys: string[],
+  keys: KeyConfig[],
   startKeyIndex: number = 0
 ): Promise<{ text: string; keyIndex: number }> {
   if (keys.length === 0) throw new Error("No NVIDIA API keys configured");
@@ -318,9 +328,9 @@ async function nimRequest(
   const totalAttempts = MAX_RETRIES_PER_KEY * keys.length;
 
   for (let attempt = 0; attempt < totalAttempts; attempt++) {
-    const currentKey = keys[keyIndex];
+    const current = keys[keyIndex];
     try {
-      const text = await nimAttempt(messages, currentKey);
+      const text = await nimAttempt(messages, current.key, current.model);
       return { text, keyIndex };
     } catch (err: any) {
       lastErr = err;
@@ -337,11 +347,11 @@ async function nimRequest(
 
       if (!isRetryable && keys.length <= 1) throw err;
 
-      // Rotate to next key
+      // Rotate to next key & model
       const nextKeyIndex = (keyIndex + 1) % keys.length;
       console.warn(
-        `[Analyst] Issue on key ${keyIndex + 1}/${keys.length} (${err?.message}). ` +
-        `Rotating to key ${nextKeyIndex + 1}...`
+        `[Analyst] Issue on Key ${keyIndex + 1} (${current.model}): ${err?.message}. ` +
+        `Failing over to Key ${nextKeyIndex + 1} (${keys[nextKeyIndex].model})...`
       );
       keyIndex = nextKeyIndex;
 
@@ -355,7 +365,7 @@ async function nimRequest(
 
 // ── Analyst class ───────────────────────────────────────────
 export class GeminiAnalyst {
-  private apiKeys: string[];
+  private apiKeys: KeyConfig[];
   private currentKeyIndex: number = 0;
   private enabled: boolean;
   private chatHistory: ChatMessage[] = [];
@@ -367,7 +377,8 @@ export class GeminiAnalyst {
     if (!this.enabled) {
       console.warn("[Analyst] No NVIDIA API keys found — analyst disabled. Add NVIDIA_API_KEY_1 (or NVIDIA_API_KEY) to env.");
     } else {
-      console.log(`[Analyst] Kimi K3 via NVIDIA NIM initialised — ${this.apiKeys.length} key(s) in rotation pool`);
+      const summary = this.apiKeys.map((c, idx) => `Key ${idx + 1}: ${c.model}`).join(" | ");
+      console.log(`[Analyst] AI Analyst initialised — ${this.apiKeys.length} slot(s): [${summary}]`);
     }
   }
 
