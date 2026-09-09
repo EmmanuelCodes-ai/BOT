@@ -18,13 +18,15 @@ const EXCLUDED_FLOWS = new Set<MarketFlow>([
 ]);
 
 const VWAP_DEVIATION_THRESHOLD_PCT = 0.3; // minimum % from VWAP to qualify
+const EXHAUSTION_RSI_SHORT = 80; // allow fading bullish EMA stack only if RSI >= 80
+const EXHAUSTION_RSI_LONG = 20;  // allow fading bearish EMA stack only if RSI <= 20
 
 export class VWAPDeviationReversalStrategy implements Strategy {
   id = StrategyId.VWAP_DEVIATION_REVERSAL;
 
   evaluate(ctx: StrategyContext): StrategyResult {
     const { candles, indicators, flow, atrMultiplierSL, riskRewardRatio } = ctx;
-    const { vwap, rsi14, atr14, close } = indicators;
+    const { vwap, rsi14, atr14, close, ema } = indicators;
 
     const noSignal = (reason: string): StrategyResult => ({
       strategyId: StrategyId.VWAP_DEVIATION_REVERSAL,
@@ -55,7 +57,23 @@ export class VWAPDeviationReversalStrategy implements Strategy {
 
     const isAboveVWAP = close > vwap.vwap;
 
-    // ── 3. RSI confirmation ───────────────────────────────
+    // ── 3. Trend Stack Guardrail ──────────────────────────
+    // Block fading a strong EMA trend stack unless RSI is at true exhaustion
+    const isBullishStack = ema.ema9 > ema.ema21 && ema.ema21 > ema.ema50;
+    const isBearishStack = ema.ema9 < ema.ema21 && ema.ema21 < ema.ema50;
+
+    if (isAboveVWAP && isBullishStack && rsi14 < EXHAUSTION_RSI_SHORT) {
+      return noSignal(
+        `Bullish EMA stack (9>21>50) active — blocking SHORT fade (RSI=${rsi14.toFixed(1)} < ${EXHAUSTION_RSI_SHORT} exhaustion)`
+      );
+    }
+    if (!isAboveVWAP && isBearishStack && rsi14 > EXHAUSTION_RSI_LONG) {
+      return noSignal(
+        `Bearish EMA stack (9<21<50) active — blocking LONG fade (RSI=${rsi14.toFixed(1)} > ${EXHAUSTION_RSI_LONG} exhaustion)`
+      );
+    }
+
+    // ── 4. RSI confirmation ───────────────────────────────
     if (isAboveVWAP && rsi14 < 60) {
       return noSignal(`Above VWAP but RSI=${rsi14.toFixed(1)} not overextended (need ≥60)`);
     }
@@ -63,7 +81,7 @@ export class VWAPDeviationReversalStrategy implements Strategy {
       return noSignal(`Below VWAP but RSI=${rsi14.toFixed(1)} not oversold (need ≤40)`);
     }
 
-    // ── 4. Rejection candle check ─────────────────────────
+    // ── 5. Rejection candle check ─────────────────────────
     // Look for a wick-heavy candle at the extreme
     const triggerCandle = candles[candles.length - 1];
     const candleRange = triggerCandle.high - triggerCandle.low;
@@ -74,7 +92,7 @@ export class VWAPDeviationReversalStrategy implements Strategy {
       return noSignal("No clear rejection candle at VWAP deviation extreme");
     }
 
-    // ── 5. Candle closed in the correct reversal direction ─
+    // ── 6. Candle closed in the correct reversal direction ─
     const closedTowardVWAP =
       (isAboveVWAP && triggerCandle.close < triggerCandle.open) || // bear close
       (!isAboveVWAP && triggerCandle.close > triggerCandle.open);   // bull close
