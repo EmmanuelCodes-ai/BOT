@@ -105,6 +105,37 @@ export function calcATR(candles: Candle[], period: number = 14): number {
   return atr;
 }
 
+/**
+ * Computes a simple moving average of ATR(atrPeriod) across the last
+ * `avgPeriod` candles. Used to derive a dynamic volatility baseline.
+ *
+ * For each of the last `avgPeriod` windows we compute the ATR,
+ * then average those values — giving a smooth "normal" ATR level.
+ * Returns 0 if not enough data is available.
+ */
+export function calcAvgATR(
+  candles: Candle[],
+  atrPeriod: number = 14,
+  avgPeriod: number = 50
+): number {
+  // We need at least (atrPeriod + avgPeriod) candles to compute
+  // ATR(atrPeriod) for avgPeriod consecutive windows.
+  const required = atrPeriod + avgPeriod;
+  if (candles.length < required) {
+    // Fall back: return a single ATR computed over all available data
+    return calcATR(candles, atrPeriod);
+  }
+
+  const atrs: number[] = [];
+  // Sample the last `avgPeriod` ATR readings, stepping back one candle each time
+  for (let offset = 0; offset < avgPeriod; offset++) {
+    const slice = candles.slice(0, candles.length - offset);
+    atrs.push(calcATR(slice, atrPeriod));
+  }
+
+  return atrs.reduce((s, v) => s + v, 0) / atrs.length;
+}
+
 // ------------------------------------------------------------
 // RSI — Relative Strength Index (14-period default)
 // ------------------------------------------------------------
@@ -388,6 +419,8 @@ export function buildIndicatorSnapshot(
   const ema = calcEMASnapshot(closes);
   const rsi14 = calcRSI(closes, 14);
   const atr14 = calcATR(allCandles, 14);
+  const avgATR50 = calcAvgATR(allCandles, 14, 50);
+  const atrExpansionRatio = avgATR50 > 0 ? atr14 / avgATR50 : 1;
   const bollinger = calcBollinger(closes, 20, 2);
   const vwap = calcVWAP(sessionCandles.length > 0 ? sessionCandles : allCandles);
   const avgVolume20 = calcAvgVolume(allCandles, 20);
@@ -400,6 +433,8 @@ export function buildIndicatorSnapshot(
     ema,
     rsi14,
     atr14,
+    avgATR50,
+    atrExpansionRatio,
     bollinger,
     vwap,
     volume: lastCandle.volume,

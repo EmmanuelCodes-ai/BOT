@@ -58,6 +58,16 @@ export class ExecutionEngine {
 
   public onTradeUpdate: ((trade: Trade) => void) | null = null;
   public onPartialProfit: ((trade: Trade, bankedRaw: number, profitPct: number, breakevenPrice: number) => void) | null = null;
+  /**
+   * Fires whenever a valid strategy signal is blocked by the
+   * pre-entry market-regime filter. Used to emit Telegram telemetry.
+   */
+  public onFilterBlocked: ((
+    signal: Signal,
+    reason: string,
+    appliedThresholds: { minVol: number; minBW: number; minATR: number },
+    isStrategyAware: boolean
+  ) => void) | null = null;
 
   constructor(exchange: Exchange, config: BotConfig, logger: BotLogger) {
     this.exchange = exchange;
@@ -105,6 +115,32 @@ export class ExecutionEngine {
         sl: signal.stopLoss,
         tp: signal.takeProfit,
       });
+      return null;
+    }
+
+    // ── 3.5 Pre-entry market-regime filter ────────────────
+    // Blocks execution during low-volatility / low-volume conditions.
+    // Uses strategy-aware thresholds so mean-reversion setups are
+    // not over-filtered during genuine overextension events.
+    const regimeCheck = this.validatePreEntryMarketRegime(signal);
+    if (!regimeCheck.passed) {
+      this.logger.warn("[Engine] Signal blocked by pre-entry regime filter", {
+        strategy: signal.strategyId,
+        direction: signal.direction,
+        reason: regimeCheck.reason,
+        bbBandwidth: signal.indicators.bollinger.bandwidth.toFixed(5),
+        atrExpansionRatio: signal.indicators.atrExpansionRatio.toFixed(3),
+        volumeMultiplier: signal.indicators.volumeMultiplier.toFixed(2),
+        strategyAware: regimeCheck.isStrategyAware,
+        appliedThresholds: regimeCheck.appliedThresholds,
+      });
+      // Fire telemetry callback → Telegram diagnostic notification
+      this.onFilterBlocked?.(
+        signal,
+        regimeCheck.reason!,
+        regimeCheck.appliedThresholds!,
+        regimeCheck.isStrategyAware
+      );
       return null;
     }
 
@@ -566,6 +602,118 @@ export class ExecutionEngine {
     }
 
     return { valid: true, reason: "OK" };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Private: global pre-entry market-regime filter (strategy-aware)
+  //
+  // Applies three checks before any order dispatch:
+  //   1. Volume Confirmation  — trigger candle >= X × 20-period avg
+  //   2. Bollinger Bandwidth  — market actively expanding, not flat
+  //   3. ATR Expansion Ratio  — current ATR vs its 50-candle average
+  //
+  // Strategy-aware sensitivity:
+  //   TREND_PULLBACK_EMA, LIQUIDITY_SWEEP_REVERSAL
+  //     → STRICT defaults (momentum required, both BB and volume)
+  //   SR_FLIP_INVERSION
+  //     → STANDARD defaults, mild volume relaxation (0.85×)
+  //   BB_MEAN_REVERSION, VWAP_DEVIATION_REVERSAL
+  //     → RELAXED volume (0.7×) and bandwidth (0.0015) ONLY when
+  //       genuine overextension is confirmed (RSI ≥70/≤30 or
+  //       VWAP deviation ≥0.5%). Otherwise uses standard defaults.
+  //       ATR ratio is ALWAYS enforced (protects against dead markets).
+  // ──────────────────────────────────────────────────────────
+
+  private validatePreEntryMarketRegime(signal: Signal): {
+    passed: boolean;
+    reason?: string;
+    isStrategyAware: boolean;
+    appliedThresholds?: { minVol: number; minBW: number; minATR: number };
+  } {
+    // Master switch — bypasses all checks when disabled
+    if (!this.config.enablePreEntryFilters) {
+      return { passed: true, isStrategyAware: false };
+    }
+
+    const { bollinger, volumeMultiplier, atrExpansionRatio, rsi14, vwap } = signal.indicators;
+    const baseVol = this.config.minVolumeMultiplier;
+    const baseBW  = this.config.minBollingerBandwidth;
+    const baseATR = this.config.minATRExpansionRatio;
+
+    // ── Derive per-strategy threshold overrides ──────────────
+    // Default: use strict base thresholds (trend/breakout strategies)
+    let minVol = baseVol;
+    let minBW  = baseBW;
+    let minATR = baseATR;
+    let isStrategyAware = false;
+
+    const sid = signal.strategyId;
+
+    if (
+      sid === StrategyId.BB_MEAN_REVERSION ||
+      sid === StrategyId.VWAP_DEVIATION_REVERSAL
+    ) {
+      // Mean-reversion strategies operate in overextension zones where
+      // volume may be declining before the reversal candle forms.
+      // Relax volume and bandwidth ONLY when extreme RSI or large
+      // VWAP deviation confirms genuine overextension — not random chop.
+      const isExtremeRSI = rsi14 >= 70 || rsi14 <= 30;
+      const isExtremeVWAP = Math.abs(vwap.deviationPct) >= 0.5;
+
+      if (isExtremeRSI || isExtremeVWAP) {
+        minVol = 0.70;   // allow lower participation during exhaustion
+        minBW  = 0.0015; // allow tighter bands (mean-reversion works here)
+        // ATR ratio stays at base — dead market risk remains
+        isStrategyAware = true;
+      }
+      // Without extreme RSI/VWAP confirmation, falls through to standard defaults
+
+    } else if (sid === StrategyId.SR_FLIP_INVERSION) {
+      // S/R flip retests happen at recently broken levels where volume
+      // was already committed during the initial break. Mild relaxation.
+      minVol = Math.max(0.85, baseVol * 0.85);
+      isStrategyAware = true;
+    }
+    // TREND_PULLBACK_EMA and LIQUIDITY_SWEEP_REVERSAL use strict defaults
+
+    const appliedThresholds = { minVol, minBW, minATR };
+
+    // ── Check 1: Volume confirmation ──────────────────────────
+    if (volumeMultiplier < minVol) {
+      return {
+        passed: false,
+        isStrategyAware,
+        appliedThresholds,
+        reason: `Volume too low: ${volumeMultiplier.toFixed(2)}x vs required ${minVol.toFixed(2)}x (20-period avg)`,
+      };
+    }
+
+    // ── Check 2: Bollinger Bandwidth ──────────────────────────
+    // Bandwidth = (upper − lower) / middle. Extreme compression means
+    // there is no directional energy to capture even for reversals.
+    if (bollinger.bandwidth < minBW) {
+      return {
+        passed: false,
+        isStrategyAware,
+        appliedThresholds,
+        reason: `Bollinger Bandwidth too compressed: ${bollinger.bandwidth.toFixed(5)} vs minimum ${minBW.toFixed(5)}`,
+      };
+    }
+
+    // ── Check 3: ATR Expansion Ratio (dynamic baseline) ───────
+    // Compares current ATR(14) against its 50-period SMA.
+    // Applied to ALL strategies — even mean-reversion should not
+    // fire in a dead/flat market with no range to capture.
+    if (atrExpansionRatio < minATR) {
+      return {
+        passed: false,
+        isStrategyAware,
+        appliedThresholds,
+        reason: `ATR contraction: expansion ratio ${atrExpansionRatio.toFixed(3)} below threshold ${minATR.toFixed(3)} (atr14/avgATR50)`,
+      };
+    }
+
+    return { passed: true, isStrategyAware, appliedThresholds };
   }
 
   // ──────────────────────────────────────────────────────────

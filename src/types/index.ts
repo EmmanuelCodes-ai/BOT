@@ -47,6 +47,8 @@ export interface IndicatorSnapshot {
   ema: EMASnapshot;
   rsi14: number;
   atr14: number;
+  avgATR50: number;         // 50-period simple average of ATR(14) values
+  atrExpansionRatio: number; // atr14 / avgATR50 — >1 = expanding, <1 = compressing
   bollinger: BollingerSnapshot;
   vwap: VWAPSnapshot;
   volume: number;
@@ -247,4 +249,8 @@ export interface BotConfig {
   partialClosePct: number;     // e.g. 0.5 to close 50% size
   breakevenBufferPct: number;  // e.g. 0.0005 (0.05%) to cover exchange fees
   breakevenBufferR?: number;   // backwards-compatibility alias
+  // ── Global Pre-Entry Market-Regime Filters ─────────────────
+  enablePreEntryFilters: boolean;   // master switch (default true)
+  minBollingerBandwidth: number;    // min BB bandwidth to confirm expansion (default 0.0025)
+  minATRExpansionRatio: number;     // atr14/avgATR50 minimum ratio (default 0.85)
 }

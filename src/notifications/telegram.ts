@@ -242,4 +242,42 @@ export class TelegramNotifier {
     if (!this.enabled) return;
     sendMessage(this.token, this.chatId, `⚠️ <b>Bot Alert</b>\n${message}`);
   }
+
+  /**
+   * Sent when the pre-entry market-regime filter blocks a valid strategy
+   * signal. Provides full diagnostic telemetry so threshold tuning can
+   * be done from Telegram without needing to check the logs.
+   */
+  notifyPreEntryFilterBlock(params: {
+    strategy: string;
+    direction: string;
+    symbol: string;
+    reason: string;
+    volumeMultiplier: number;
+    minVolumeMultiplier: number;
+    bbBandwidth: number;
+    minBollingerBandwidth: number;
+    atrExpansionRatio: number;
+    minATRExpansionRatio: number;
+    isStrategyAware: boolean;
+  }): void {
+    if (!this.enabled) return;
+
+    const volOk  = params.volumeMultiplier  >= params.minVolumeMultiplier  ? "✅" : "❌";
+    const bwOk   = params.bbBandwidth       >= params.minBollingerBandwidth ? "✅" : "❌";
+    const atrOk  = params.atrExpansionRatio >= params.minATRExpansionRatio  ? "✅" : "❌";
+    const modeTag = params.isStrategyAware ? " <i>(strategy-aware thresholds)</i>" : "";
+
+    const msg =
+      `🚫 <b>Signal Filtered — Pre-Entry Gate</b>${modeTag}\n` +
+      `Strategy : ${params.strategy} ${params.direction}\n` +
+      `Symbol   : ${params.symbol}\n\n` +
+      `<b>Reason:</b> ${params.reason}\n\n` +
+      `<b>Metrics vs Thresholds:</b>\n` +
+      `${volOk} Volume    : ${params.volumeMultiplier.toFixed(2)}x  (min ${params.minVolumeMultiplier.toFixed(2)}x)\n` +
+      `${bwOk} BB Width  : ${params.bbBandwidth.toFixed(5)}  (min ${params.minBollingerBandwidth.toFixed(5)})\n` +
+      `${atrOk} ATR Ratio : ${params.atrExpansionRatio.toFixed(3)}  (min ${params.minATRExpansionRatio.toFixed(3)})`;
+
+    sendMessage(this.token, this.chatId, msg);
+  }
 }

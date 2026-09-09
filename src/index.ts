@@ -68,7 +68,7 @@ function loadConfig(): BotConfig {
     h1Timeframe: "1h",
     h4Timeframe: "4h",
     leverage: parseFloat(process.env.LEVERAGE ?? "10"),
-    minVolumeMultiplier: parseFloat(process.env.MIN_VOLUME_MULTIPLIER ?? "0.8"),
+    minVolumeMultiplier: parseFloat(process.env.MIN_VOLUME_MULTIPLIER ?? "1.0"),
     maxOpenTrades: parseInt(process.env.MAX_OPEN_TRADES ?? "2", 10),
     paperTrading: process.env.PAPER_TRADING !== "false",
     paperBalance: parseFloat(process.env.PAPER_BALANCE ?? "10000"),
@@ -83,8 +83,15 @@ function loadConfig(): BotConfig {
       const raw = parseFloat(process.env.BREAKEVEN_BUFFER_PCT ?? "0.0005");
       return raw >= 0.01 ? raw / 100 : raw; // accepts 0.05 (0.05%) or 0.0005
     })(),
+    // ── Global Pre-Entry Market-Regime Filters ─────────────────
+    // All three are evaluated centrally in ExecutionEngine before
+    // any order is sized or dispatched to the exchange.
+    enablePreEntryFilters: process.env.ENABLE_PRE_ENTRY_FILTERS !== "false",
+    minBollingerBandwidth: parseFloat(process.env.MIN_BOLLINGER_BANDWIDTH ?? "0.0025"),
+    minATRExpansionRatio: parseFloat(process.env.MIN_ATR_EXPANSION_RATIO ?? "0.85"),
   };
 }
+
 
 // ============================================================
 // 2. Exchange factory
@@ -310,6 +317,23 @@ class TradingBot {
           `🛡️ <b>Risk-Free Milestone Reached:</b> Early partial profit of +$${bankedRaw.toFixed(2)} (${roiFormatted}) secured on ${trade.symbol}. Stop Loss shifted to breakeven (${breakevenPrice}). Remaining position is now running 100% risk-free!`
         );
       }
+    };
+
+    // Wire pre-entry filter blocks to Telegram diagnostic telemetry
+    this.engine.onFilterBlocked = (signal, reason, thresholds, isStrategyAware) => {
+      this.telegram.notifyPreEntryFilterBlock({
+        strategy: signal.strategyId,
+        direction: signal.direction,
+        symbol: signal.symbol,
+        reason,
+        volumeMultiplier: signal.indicators.volumeMultiplier,
+        minVolumeMultiplier: thresholds.minVol,
+        bbBandwidth: signal.indicators.bollinger.bandwidth,
+        minBollingerBandwidth: thresholds.minBW,
+        atrExpansionRatio: signal.indicators.atrExpansionRatio,
+        minATRExpansionRatio: thresholds.minATR,
+        isStrategyAware,
+      });
     };
   }
 
