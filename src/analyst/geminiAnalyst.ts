@@ -6,10 +6,7 @@
 // ============================================================
 
 import * as https from "https";
-
-const NIM_HOST = "integrate.api.nvidia.com";
-const NIM_PATH = "/v1/chat/completions";
-const MODEL = process.env.NVIDIA_MODEL ?? "moonshotai/kimi-k3";
+import { AiKeyPoolManager, AiChatMessage } from "./aiPoolService";
 
 // ── Bot context snapshot & telemetry ────────────────────────
 
@@ -198,192 +195,35 @@ ${recentTradesText}
 }
 
 // ── Message type ────────────────────────────────────────────
-interface ChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
-}
-
-interface KeyConfig {
-  key: string;
-  model: string;
-}
-
-// ── Single HTTP attempt (SSE streaming) ─────────────────────
-function nimAttempt(messages: ChatMessage[], apiKey: string, model: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      model,
-      messages,
-      max_tokens: 2048,
-      temperature: 0.7,
-      stream: true,
-    });
-
-    const options = {
-      hostname: NIM_HOST,
-      path: NIM_PATH,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-        "Accept": "text/event-stream",
-        "Content-Length": Buffer.byteLength(body),
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      // Check for non-200 HTTP status
-      if (res.statusCode && res.statusCode !== 200) {
-        let errBody = "";
-        res.on("data", (chunk: Buffer) => {
-          errBody += chunk.toString("utf8");
-        });
-        res.on("end", () => {
-          reject(new Error(`NIM_ERROR_${res.statusCode}: ${errBody.slice(0, 300)}`));
-        });
-        return;
-      }
-
-      let fullText = "";
-      let rawBuffer = "";
-
-      res.on("data", (chunk: Buffer) => {
-        rawBuffer += chunk.toString("utf8");
-        const lines = rawBuffer.split("\n");
-        rawBuffer = lines.pop() ?? ""; // keep incomplete line in buffer
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed === "data: [DONE]") continue;
-          if (!trimmed.startsWith("data: ")) continue;
-
-          try {
-            const json = JSON.parse(trimmed.slice(6));
-            const delta = json?.choices?.[0]?.delta?.content ?? "";
-            fullText += delta;
-          } catch {
-            // skip malformed chunks
-          }
-        }
-      });
-
-      res.on("end", () => {
-        const result = fullText.trim();
-        resolve(result);
-      });
-
-      res.on("error", reject);
-    });
-
-    req.on("error", reject);
-
-    // 25 second timeout for snappy response & fast failover
-    req.setTimeout(25000, () => {
-      req.destroy();
-      reject(new Error(`NIM request timed out after 25s (${model})`));
-    });
-
-    req.write(body);
-    req.end();
-  });
-}
-
-// ── API key & Model pool (multi-model failover) ─────────────
-function loadApiKeys(): KeyConfig[] {
-  const configs: KeyConfig[] = [];
-  let i = 1;
-  while (true) {
-    const k = process.env[`NVIDIA_API_KEY_${i}`];
-    if (!k) break;
-    // Model for this key: NVIDIA_MODEL_i, or fallback to default per slot
-    const defaultModel = i === 2 ? "deepseek-ai/deepseek-v4-pro-0813" : "moonshotai/kimi-k3";
-    const model = process.env[`NVIDIA_MODEL_${i}`] ?? process.env.NVIDIA_MODEL ?? defaultModel;
-    configs.push({ key: k, model });
-    i++;
-  }
-  // Fall back to legacy single-key env var
-  if (configs.length === 0) {
-    const legacy = process.env.NVIDIA_API_KEY ?? "";
-    if (legacy) {
-      configs.push({ key: legacy, model: process.env.NVIDIA_MODEL ?? "moonshotai/kimi-k3" });
-    }
-  }
-  return configs;
-}
-
-// ── HTTP request with key/model rotation + retry ─────────────
-const MAX_RETRIES_PER_KEY = 2;
-const BASE_DELAY_MS = 2_000;
-
-async function nimRequest(
-  messages: ChatMessage[],
-  keys: KeyConfig[],
-  startKeyIndex: number = 0
-): Promise<{ text: string; keyIndex: number }> {
-  if (keys.length === 0) throw new Error("No NVIDIA API keys configured");
-
-  let lastErr: Error = new Error("Unknown NIM error");
-  let keyIndex = startKeyIndex % keys.length;
-
-  const totalAttempts = MAX_RETRIES_PER_KEY * keys.length;
-
-  for (let attempt = 0; attempt < totalAttempts; attempt++) {
-    const current = keys[keyIndex];
-    try {
-      const text = await nimAttempt(messages, current.key, current.model);
-      return { text, keyIndex };
-    } catch (err: any) {
-      lastErr = err;
-      const errMsg = String(err?.message ?? "").toLowerCase();
-      const isRetryable =
-        errMsg.includes("nim_") ||
-        errMsg.includes("timeout") ||
-        errMsg.includes("timed out") ||
-        errMsg.includes("overload") ||
-        errMsg.includes("too many") ||
-        errMsg.includes("rate limit") ||
-        errMsg.includes("socket") ||
-        errMsg.includes("econn");
-
-      if (!isRetryable && keys.length <= 1) throw err;
-
-      // Rotate to next key & model
-      const nextKeyIndex = (keyIndex + 1) % keys.length;
-      console.warn(
-        `[Analyst] Issue on Key ${keyIndex + 1} (${current.model}): ${err?.message}. ` +
-        `Failing over to Key ${nextKeyIndex + 1} (${keys[nextKeyIndex].model})...`
-      );
-      keyIndex = nextKeyIndex;
-
-      const delayMs = BASE_DELAY_MS * Math.pow(1.5, Math.floor(attempt / keys.length));
-      await new Promise((r) => setTimeout(r, delayMs));
-    }
-  }
-
-  throw lastErr;
-}
+export type ChatMessage = AiChatMessage;
 
 // ── Analyst class ───────────────────────────────────────────
 export class GeminiAnalyst {
-  private apiKeys: KeyConfig[];
-  private currentKeyIndex: number = 0;
+  private pool: AiKeyPoolManager;
   private enabled: boolean;
   private chatHistory: ChatMessage[] = [];
 
   constructor() {
-    this.apiKeys = loadApiKeys();
-    this.enabled = this.apiKeys.length > 0;
+    this.pool = new AiKeyPoolManager();
+    this.enabled = this.pool.isEnabled();
 
     if (!this.enabled) {
-      console.warn("[Analyst] No NVIDIA API keys found — analyst disabled. Add NVIDIA_API_KEY_1 (or NVIDIA_API_KEY) to env.");
+      console.warn("[Analyst] No AI keys found — analyst disabled. Add NVIDIA_API_KEY_* or OPENROUTER_API_KEY_* to env.");
     } else {
-      const summary = this.apiKeys.map((c, idx) => `Key ${idx + 1}: ${c.model}`).join(" | ");
-      console.log(`[Analyst] AI Analyst initialised — ${this.apiKeys.length} slot(s): [${summary}]`);
+      const status = this.pool.getPoolStatus();
+      console.log(
+        `[Analyst] AI Analyst initialised — Unified Rotation Pool: ${status.totalKeys} keys ` +
+        `(${status.nvidiaKeys} NVIDIA, ${status.openrouterKeys} OpenRouter)`
+      );
     }
   }
 
   isEnabled(): boolean {
     return this.enabled;
+  }
+
+  getPoolStatus() {
+    return this.pool.getPoolStatus();
   }
 
   // ──────────────────────────────────────────────────────────
@@ -467,7 +307,7 @@ Summarize today's performance, audit every dollar gained/lost, evaluate current 
   // ──────────────────────────────────────────────────────────
 
   async chat(userMessage: string, context: BotContext): Promise<string> {
-    if (!this.enabled) return "AI analyst is not configured. Add NVIDIA_API_KEY to Railway variables.";
+    if (!this.enabled) return "AI analyst is not configured. Add NVIDIA_API_KEY_* or OPENROUTER_API_KEY_* to environment.";
 
     const formattedContext = formatContextForPrompt(context);
 
@@ -481,8 +321,8 @@ Summarize today's performance, audit every dollar gained/lost, evaluate current 
     ];
 
     try {
-      const { text: reply, keyIndex } = await nimRequest(messages, this.apiKeys, this.currentKeyIndex);
-      this.currentKeyIndex = keyIndex; // stick with the key that worked
+      const result = await this.pool.generateCompletion(messages, { maxTokens: 1024, temperature: 0.7 });
+      const reply = result.text;
 
       this.chatHistory.push({ role: "user", content: userMessage });
       this.chatHistory.push({ role: "assistant", content: reply });
@@ -502,9 +342,8 @@ Summarize today's performance, audit every dollar gained/lost, evaluate current 
 
   private async generate(messages: ChatMessage[]): Promise<string | null> {
     try {
-      const { text, keyIndex } = await nimRequest(messages, this.apiKeys, this.currentKeyIndex);
-      this.currentKeyIndex = keyIndex; // remember which key succeeded
-      return text.length > 10 ? text : null;
+      const result = await this.pool.generateCompletion(messages, { maxTokens: 1024, temperature: 0.7 });
+      return result.text && result.text.length > 10 ? result.text : null;
     } catch (err: any) {
       console.error("[Analyst] Generation error:", err.message);
       return null;

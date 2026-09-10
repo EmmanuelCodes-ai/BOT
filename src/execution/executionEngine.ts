@@ -26,6 +26,8 @@ import {
   BotConfig,
   Candle,
   LiveBybitPosition,
+  MarketFlow,
+  MacroBias,
 } from "../types";
 import { BotLogger } from "../logger";
 import { TradeLedger } from "./ledger";
@@ -398,6 +400,17 @@ export class ExecutionEngine {
       const roiFormatted = `+${currentROI.toFixed(2)}% ROI`;
       const pricePctFormatted = `+${rawPricePct.toFixed(3)}%`;
 
+      // Check minimum order size from exchange
+      const minQty = this.exchange.markets?.[trade.symbol]?.limits?.amount?.min ?? 0;
+      if (minQty > 0 && closeSize < minQty) {
+        this.logger.warn("[Engine] Partial close size below Bybit minimum order quantity — skipping partial", {
+          closeSize,
+          minQty,
+          symbol: trade.symbol,
+        });
+        return;
+      }
+
       // If live trading on Bybit, place reduce-only market order
       const hasApiKey = Boolean(this.exchange.apiKey && this.exchange.apiKey.trim().length > 5);
       if (hasApiKey && !this.config.paperTrading) {
@@ -415,11 +428,19 @@ export class ExecutionEngine {
             side,
             closeSize,
             undefined,
-            { reduceOnly: true }
+            {
+              reduceOnly: true,
+              positionIdx: 0,
+            }
           );
           this.logger.info("[Engine] Bybit early partial filled", { orderId: resp.id, closeSize });
         } catch (orderErr) {
-          this.logger.error("[Engine] Bybit early partial close failed", { error: String(orderErr) });
+          this.logger.error("[Engine] Bybit early partial close failed — aborting state change", {
+            error: String(orderErr),
+            symbol: trade.symbol,
+            closeSize,
+          });
+          return;
         }
       }
 
@@ -718,9 +739,105 @@ export class ExecutionEngine {
           }
         }
       }
+
+      // 2. Adopt any active Bybit positions NOT yet tracked in memory (e.g. after restart or manual entry)
+      for (const pos of livePositions) {
+        if (pos.size <= 0) continue;
+        const baseSymbol = pos.symbol.split("/")[0];
+        const isLong = pos.side === "long";
+        const alreadyTracked = Array.from(this.state.openTrades.values()).some(
+          (t) =>
+            (t.symbol === pos.symbol || t.symbol.includes(baseSymbol)) &&
+            t.direction === (isLong ? SignalDirection.LONG : SignalDirection.SHORT)
+        );
+
+        if (!alreadyTracked) {
+          const adoptedTrade = this.adoptLivePosition(pos);
+          this.state.openTrades.set(adoptedTrade.id, adoptedTrade);
+          this.ledger.recordOpen(adoptedTrade, pos.entryPrice);
+          this.onTradeUpdate?.(adoptedTrade);
+
+          this.logger.info("[Engine] Adopted live Bybit position into active management", {
+            id: adoptedTrade.id.slice(0, 8),
+            symbol: adoptedTrade.symbol,
+            direction: adoptedTrade.direction,
+            size: adoptedTrade.size,
+            entry: adoptedTrade.entryPrice,
+            sl: adoptedTrade.stopLoss,
+            tp: adoptedTrade.takeProfit,
+          });
+        }
+      }
     } catch (err) {
       this.logger.error("[Engine] Error during syncWithLivePositions", { error: String(err) });
     }
+  }
+
+  /**
+   * Constructs an active Trade record from a live Bybit position, enabling
+   * the bot to actively monitor ROI, harvest early partials, and move stops.
+   */
+  private adoptLivePosition(pos: LiveBybitPosition): Trade {
+    const isLong = pos.side === "long";
+    const now = Date.now();
+    const tradeId = uuidv4();
+
+    // Default 1.5% SL and 3% TP if not configured on exchange
+    const defaultSl = isLong ? pos.entryPrice * 0.985 : pos.entryPrice * 1.015;
+    const defaultTp = isLong ? pos.entryPrice * 1.03 : pos.entryPrice * 0.97;
+    const sl = pos.stopLoss && pos.stopLoss > 0 ? pos.stopLoss : defaultSl;
+    const tp = pos.takeProfit && pos.takeProfit > 0 ? pos.takeProfit : defaultTp;
+
+    const order: Order = {
+      id: uuidv4(),
+      exchangeOrderId: null,
+      symbol: pos.symbol,
+      direction: isLong ? SignalDirection.LONG : SignalDirection.SHORT,
+      size: pos.size,
+      entryPrice: pos.entryPrice,
+      stopLoss: sl,
+      takeProfit: tp,
+      status: OrderStatus.FILLED,
+      placedAt: pos.updatedTime ?? now,
+      filledAt: pos.updatedTime ?? now,
+      closedAt: null,
+    };
+
+    const trade: Trade = {
+      id: tradeId,
+      signalId: `bybit-sync-${pos.symbol}-${now}`,
+      order,
+      symbol: pos.symbol,
+      strategyId: StrategyId.EXTERNAL_POSITION,
+      flow: {
+        flow: MarketFlow.UNDEFINED,
+        macroBias: MacroBias.NEUTRAL,
+        h1Bias: MacroBias.NEUTRAL,
+        h4Bias: MacroBias.NEUTRAL,
+        confidence: 1,
+        timestamp: now,
+      },
+      direction: isLong ? SignalDirection.LONG : SignalDirection.SHORT,
+      entryPrice: pos.entryPrice,
+      exitPrice: null,
+      stopLoss: sl,
+      takeProfit: tp,
+      size: pos.size,
+      originalSize: pos.size,
+      originalStopLoss: sl,
+      partialTaken: false,
+      isBreakeven: false,
+      pnlRaw: pos.unrealizedPnl,
+      pnlR: null,
+      outcome: TradeOutcome.OPEN,
+      openedAt: pos.updatedTime ?? now,
+      closedAt: null,
+      durationMs: null,
+      indicators: {} as any,
+      notes: `Active Bybit Position (Adopted) | Lev: ${pos.leverage}x`,
+    };
+
+    return trade;
   }
 
 

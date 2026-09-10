@@ -421,12 +421,28 @@ class TradingBot {
             (!this.config.paperTrading ? `\nBybit Pos    :${livePosText}` : "");
           await this.poller!.sendMessage(id, msg);
 
+        } else if (command === "/keys" || command === "/pool") {
+          const poolStatus = this.analyst.getPoolStatus();
+          const activePercent = poolStatus.totalKeys > 0 ? Math.round((poolStatus.healthyKeys / poolStatus.totalKeys) * 100) : 0;
+          const msg =
+            `🔑 <b>AI Key Pool Status</b>\n\n` +
+            `Total Keys    : ${poolStatus.totalKeys} (NVIDIA: ${poolStatus.nvidiaKeys} | OpenRouter: ${poolStatus.openrouterKeys})\n` +
+            `Healthy       : ${poolStatus.healthyKeys}/${poolStatus.totalKeys} (${activePercent}%)\n` +
+            `In Cooldown   : ${poolStatus.coolingDownKeys}\n\n` +
+            `<b>Slots:</b>\n` +
+            poolStatus.slots.map((s) => {
+              const state = s.isHealthy ? "🟢 Ready" : `🔴 Cool (${s.cooldownRemainingSec}s)`;
+              return `• <code>${s.id}</code> [${s.provider.toUpperCase()}]: ${state} (OK: ${s.successCount}, Err: ${s.failureCount})`;
+            }).join("\n");
+          await this.poller!.sendMessage(id, msg);
+
         } else if (command === "/help") {
           await this.poller!.sendMessage(id,
             `🤖 <b>Bot Commands</b>\n\n` +
             `/pause — Pause automated strategy trades\n` +
             `/resume — Resume automated strategy trades\n` +
             `/status — Current price, balance & trade status\n` +
+            `/keys — View unified AI key pool status & health\n` +
             `/help — Show this menu\n\n` +
             `Or just type any question to chat with the AI analyst.`
           );
