@@ -25,6 +25,7 @@ import {
   TradeOutcome,
   BotConfig,
   Candle,
+  LiveBybitPosition,
 } from "../types";
 import { BotLogger } from "../logger";
 import { TradeLedger } from "./ledger";
@@ -96,13 +97,45 @@ export class ExecutionEngine {
       return null;
     }
 
-    // ── 2. Max open trades guard ───────────────────────────
-    if (this.state.openTrades.size >= this.config.maxOpenTrades) {
-      this.logger.warn("[Engine] Max open trades reached — skipping signal", {
-        max: this.config.maxOpenTrades,
-        current: this.state.openTrades.size,
-      });
-      return null;
+    // ── 2. Max open trades guard (Bybit API as Absolute Source of Truth) ─
+    if (this.config.paperTrading) {
+      if (this.state.openTrades.size >= this.config.maxOpenTrades) {
+        this.logger.warn("[Engine] Max open trades reached (Paper) — skipping signal", {
+          max: this.config.maxOpenTrades,
+          current: this.state.openTrades.size,
+        });
+        return null;
+      }
+    } else {
+      // First, sync any recent exchange-side closures directly from Bybit
+      await this.syncWithLivePositions();
+
+      const livePositions = await this.fetchLivePositions(signal.symbol);
+      if (livePositions.length >= this.config.maxOpenTrades) {
+        this.logger.warn("[Engine] Execution blocked: Bybit has active position(s)", {
+          maxAllowed: this.config.maxOpenTrades,
+          liveCount: livePositions.length,
+          positions: livePositions.map(
+            (p) => `${p.side.toUpperCase()} ${p.size} @ ${p.entryPrice} (uPnL: ${p.unrealizedPnl})`
+          ),
+        });
+        return null;
+      }
+
+      // Check if there is already an active position for this exact symbol on Bybit
+      const baseSymbol = signal.symbol.split("/")[0];
+      const existingPos = livePositions.find(
+        (p) => p.symbol === signal.symbol || p.symbol.includes(baseSymbol)
+      );
+      if (existingPos) {
+        this.logger.warn("[Engine] Execution blocked: Bybit position already open for symbol", {
+          symbol: signal.symbol,
+          existingSide: existingPos.side,
+          existingSize: existingPos.size,
+          signalDirection: signal.direction,
+        });
+        return null;
+      }
     }
 
     // ── 3. Order sanity validation ─────────────────────────
@@ -514,6 +547,182 @@ export class ExecutionEngine {
   getOpenTradeCount(): number {
     return this.state.openTrades.size;
   }
+
+  // ──────────────────────────────────────────────────────────
+  // Bybit V5 Live Position Integration (Absolute Source of Truth)
+  // ──────────────────────────────────────────────────────────
+
+  /**
+   * Fetches active positions directly from Bybit's API as the absolute source of truth.
+   * In live mode, queries exchange positions where size / contracts > 0.
+   */
+  async fetchLivePositions(symbol?: string): Promise<LiveBybitPosition[]> {
+    if (this.config.paperTrading) {
+      return Array.from(this.state.openTrades.values()).map((t) => ({
+        symbol: t.symbol,
+        side: t.direction === SignalDirection.LONG ? "long" : "short",
+        size: t.size,
+        entryPrice: t.entryPrice,
+        unrealizedPnl: t.pnlRaw ?? 0,
+        leverage: this.config.leverage ?? 10,
+        stopLoss: t.stopLoss,
+        takeProfit: t.takeProfit,
+        markPrice: t.entryPrice,
+      }));
+    }
+
+    try {
+      const targetSymbol = symbol ?? this.config.symbol;
+      let rawPositions: any[] = [];
+
+      try {
+        rawPositions = await this.exchange.fetchPositions([targetSymbol]);
+      } catch (ccxtErr) {
+        // Fallback: direct Bybit V5 privateGetV5PositionList
+        if (typeof (this.exchange as any).privateGetV5PositionList === "function") {
+          const marketId = (this.exchange.market(targetSymbol)?.id ?? targetSymbol.replace("/", "").split(":")[0]).replace(/[^a-zA-Z0-9]/g, "");
+          const resp = await (this.exchange as any).privateGetV5PositionList({
+            category: "linear",
+            symbol: marketId,
+          });
+          rawPositions = (resp?.result?.list ?? []).map((item: any) => ({
+            symbol: targetSymbol,
+            side: item.side?.toLowerCase(),
+            contracts: parseFloat(item.size || "0"),
+            entryPrice: parseFloat(item.avgPrice || "0"),
+            unrealizedPnl: parseFloat(item.unrealisedPnl || "0"),
+            leverage: parseFloat(item.leverage || "1"),
+            stopLoss: parseFloat(item.stopLoss || "0"),
+            takeProfit: parseFloat(item.takeProfit || "0"),
+            markPrice: parseFloat(item.markPrice || "0"),
+            bustPrice: parseFloat(item.bustPrice || "0"),
+            info: item,
+          }));
+        } else {
+          throw ccxtErr;
+        }
+      }
+
+      const activePositions: LiveBybitPosition[] = [];
+
+      for (const pos of rawPositions) {
+        const rawSize = pos.contracts ?? (pos.info as any)?.size;
+        const contracts = Math.abs(parseFloat(String(rawSize ?? 0)));
+        if (contracts > 0) {
+          const rawSide = (pos.side ?? (pos.info as any)?.side ?? "").toLowerCase();
+          const side: "long" | "short" = (rawSide === "buy" || rawSide === "long") ? "long" : "short";
+          const entryPrice = pos.entryPrice ?? parseFloat((pos.info as any)?.avgPrice ?? "0");
+          const unrealizedPnl = pos.unrealizedPnl ?? parseFloat((pos.info as any)?.unrealisedPnl ?? "0");
+          const leverage = pos.leverage ?? parseFloat((pos.info as any)?.leverage ?? "1");
+          const sl = pos.stopLoss ?? parseFloat((pos.info as any)?.stopLoss ?? "0");
+          const tp = pos.takeProfit ?? parseFloat((pos.info as any)?.takeProfit ?? "0");
+          const markPrice = pos.markPrice ?? parseFloat((pos.info as any)?.markPrice ?? "0");
+          const bustPrice = parseFloat((pos.info as any)?.bustPrice ?? "0");
+
+          activePositions.push({
+            symbol: pos.symbol ?? targetSymbol,
+            side,
+            size: contracts,
+            entryPrice,
+            unrealizedPnl,
+            leverage,
+            stopLoss: sl > 0 ? sl : undefined,
+            takeProfit: tp > 0 ? tp : undefined,
+            markPrice: markPrice > 0 ? markPrice : undefined,
+            bustPrice: bustPrice > 0 ? bustPrice : undefined,
+            updatedTime: (pos.info as any)?.updatedTime ? parseInt((pos.info as any).updatedTime, 10) : undefined,
+          });
+        }
+      }
+
+      return activePositions;
+    } catch (err) {
+      this.logger.error("[Engine] fetchLivePositions failed", { error: String(err) });
+      return [];
+    }
+  }
+
+  /**
+   * Reconciles internal in-memory trades and ledger with live positions from Bybit.
+   * If Bybit shows 0 position or trade is no longer active on exchange, it marks
+   * the trade closed in local memory & ledger, preventing ghost positions.
+   */
+  async syncWithLivePositions(currentPrice?: number): Promise<void> {
+    if (this.config.paperTrading) return;
+
+    try {
+      const livePositions = await this.fetchLivePositions();
+
+      for (const [tradeId, trade] of Array.from(this.state.openTrades.entries())) {
+        const baseSymbol = trade.symbol.split("/")[0];
+        const matchingPos = livePositions.find(
+          (p) =>
+            (p.symbol === trade.symbol || p.symbol.includes(baseSymbol)) &&
+            p.side === (trade.direction === SignalDirection.LONG ? "long" : "short")
+        );
+
+        if (!matchingPos) {
+          // Position is completely closed on Bybit!
+          const exitPrice = currentPrice && currentPrice > 0 ? currentPrice : trade.entryPrice;
+          const isLong = trade.direction === SignalDirection.LONG;
+          const rawGain = isLong ? exitPrice - trade.entryPrice : trade.entryPrice - exitPrice;
+          let outcome = rawGain > 0 ? TradeOutcome.WIN : (rawGain < 0 ? TradeOutcome.LOSS : TradeOutcome.BREAKEVEN);
+          let note = "Closed on Bybit (Exchange-side TP/SL or manual exit)";
+
+          if (currentPrice && currentPrice > 0) {
+            if (trade.direction === SignalDirection.LONG) {
+              if (trade.takeProfit && currentPrice >= trade.takeProfit) {
+                outcome = TradeOutcome.WIN;
+                note = "Bybit Take Profit executed";
+              } else if (trade.stopLoss && currentPrice <= trade.stopLoss) {
+                outcome = trade.isBreakeven ? TradeOutcome.BREAKEVEN : TradeOutcome.LOSS;
+                note = trade.isBreakeven ? "Bybit Breakeven Stop executed" : "Bybit Stop Loss executed";
+              }
+            } else {
+              if (trade.takeProfit && currentPrice <= trade.takeProfit) {
+                outcome = TradeOutcome.WIN;
+                note = "Bybit Take Profit executed";
+              } else if (trade.stopLoss && currentPrice >= trade.stopLoss) {
+                outcome = trade.isBreakeven ? TradeOutcome.BREAKEVEN : TradeOutcome.LOSS;
+                note = trade.isBreakeven ? "Bybit Breakeven Stop executed" : "Bybit Stop Loss executed";
+              }
+            }
+          }
+
+          this.logger.info("[Engine] Live position closed on Bybit — reconciling local state", {
+            tradeId: trade.id.slice(0, 8),
+            symbol: trade.symbol,
+            direction: trade.direction,
+            outcome,
+            note,
+          });
+
+          this.closeTrade(trade, exitPrice, outcome, Date.now(), note);
+        } else {
+          // Position still active on Bybit: sync size and stop loss if updated
+          if (matchingPos.size > 0 && matchingPos.size < trade.size) {
+            this.logger.info("[Engine] Live position size reduced on Bybit — updating internal size", {
+              tradeId: trade.id.slice(0, 8),
+              previousSize: trade.size,
+              currentBybitSize: matchingPos.size,
+            });
+            trade.size = matchingPos.size;
+          }
+          if (matchingPos.stopLoss && matchingPos.stopLoss > 0 && matchingPos.stopLoss !== trade.stopLoss) {
+            trade.stopLoss = matchingPos.stopLoss;
+            trade.order.stopLoss = matchingPos.stopLoss;
+          }
+          if (matchingPos.takeProfit && matchingPos.takeProfit > 0 && matchingPos.takeProfit !== trade.takeProfit) {
+            trade.takeProfit = matchingPos.takeProfit;
+            trade.order.takeProfit = matchingPos.takeProfit;
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.error("[Engine] Error during syncWithLivePositions", { error: String(err) });
+    }
+  }
+
 
   // ──────────────────────────────────────────────────────────
   // Public: initialise balance snapshot on startup

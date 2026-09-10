@@ -121,6 +121,7 @@ function buildExchange(config: BotConfig): Exchange {
         },
       },
     }),
+    timeout: 25000,
     options: {
       defaultType: process.env.MARKET_TYPE ?? "future",
       fetchCurrencies: false,
@@ -394,6 +395,19 @@ class TradingBot {
           const ind = this.latestIndicators;
           const mode = this.config.paperTrading ? "PAPER TRADING" : "LIVE BYBIT";
           const autoStatus = this.autoTradingEnabled ? "ACTIVE ▶️" : "PAUSED ⏸️";
+
+          let livePosText = "";
+          if (!this.config.paperTrading) {
+            try {
+              const livePos = await this.engine.fetchLivePositions();
+              livePosText = livePos.length > 0
+                ? livePos.map((p) => `\n  • ${p.side.toUpperCase()} ${p.size} @ $${p.entryPrice} (uPnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)})`).join("")
+                : " None (0 active)";
+            } catch (e) {
+              livePosText = " Error querying Bybit";
+            }
+          }
+
           const msg =
             `📊 <b>Bot Status</b>\n\n` +
             `Trading Mode : ${mode}\n` +
@@ -403,7 +417,8 @@ class TradingBot {
             `RSI(14)      : ${ind ? ind.rsi14.toFixed(1) : "—"}\n` +
             `Equity       : $${bal.equity.toFixed(2)}\n` +
             `Available    : $${bal.availableBalance.toFixed(2)}\n` +
-            `Open Pos     : ${open}`;
+            `Internal Pos : ${open}` +
+            (!this.config.paperTrading ? `\nBybit Pos    :${livePosText}` : "");
           await this.poller!.sendMessage(id, msg);
 
         } else if (command === "/help") {
@@ -429,6 +444,25 @@ class TradingBot {
 
     process.on("SIGINT", () => this.shutdown("SIGINT"));
     process.on("SIGTERM", () => this.shutdown("SIGTERM"));
+
+    // Sync existing exchange positions on startup
+    if (!this.config.paperTrading) {
+      try {
+        this.logger.info("[Bot] Checking Bybit live positions on startup...");
+        await this.engine.syncWithLivePositions();
+        const initialPositions = await this.engine.fetchLivePositions();
+        if (initialPositions.length > 0) {
+          this.logger.info("[Bot] Active Bybit position(s) detected on startup", {
+            count: initialPositions.length,
+            positions: initialPositions.map((p) => `${p.side.toUpperCase()} ${p.size} @ $${p.entryPrice}`),
+          });
+        } else {
+          this.logger.info("[Bot] 0 active positions on Bybit on startup.");
+        }
+      } catch (posErr) {
+        this.logger.warn("[Bot] Error checking Bybit positions on startup", { error: String(posErr) });
+      }
+    }
 
     await this.loop();
   }
@@ -456,17 +490,24 @@ class TradingBot {
       await this.fireDailySummary();
     }
 
-    // ── Check open trades on live ticker / mark price (runs every 15s) ──
-    if (this.engine.getOpenTradeCount() > 0) {
-      try {
-        const ticker = await this.exchange.fetchTicker(this.config.symbol);
-        const currentPrice = ticker.last ?? ticker.close ?? 0;
-        if (currentPrice > 0) {
+    // ── Live ticker & position synchronization (runs every 15s) ──
+    try {
+      const ticker = await this.exchange.fetchTicker(this.config.symbol);
+      const currentPrice = ticker.last ?? ticker.close ?? 0;
+      if (currentPrice > 0) {
+        this.lastPrice = currentPrice;
+
+        // Reconcile in-memory trades with Bybit exchange state (exchange-side TP/SL or manual exit)
+        if (!this.config.paperTrading) {
+          await this.engine.syncWithLivePositions(currentPrice);
+        }
+
+        if (this.engine.getOpenTradeCount() > 0) {
           await this.engine.checkTradeProgress(currentPrice);
         }
-      } catch (tickerErr) {
-        this.logger.debug("[Main] Ticker fetch for open trades error", { error: String(tickerErr) });
       }
+    } catch (tickerErr) {
+      this.logger.debug("[Main] Ticker fetch / live position sync error", { error: String(tickerErr) });
     }
 
     // ── Fetch M5 candles (300 ≈ 25 hours) ─────────────────

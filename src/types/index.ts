@@ -254,3 +254,22 @@ export interface BotConfig {
   minBollingerBandwidth: number;    // min BB bandwidth to confirm expansion (default 0.0025)
   minATRExpansionRatio: number;     // atr14/avgATR50 minimum ratio (default 0.85)
 }
+
+// ------------------------------------------------------------
+// Live Exchange Position (Bybit V5 Source of Truth)
+// ------------------------------------------------------------
+export interface LiveBybitPosition {
+  symbol: string;
+  side: "long" | "short";
+  size: number;               // contracts / units (> 0)
+  entryPrice: number;
+  unrealizedPnl: number;
+  leverage: number;
+  stopLoss?: number;
+  takeProfit?: number;
+  markPrice?: number;
+  bustPrice?: number;         // liquidation price
+  trailingStop?: number;
+  updatedTime?: number;
+}
+
