@@ -253,6 +253,32 @@ export class TradeLedger {
     this.saveToDisk();
   }
 
+  // ── Record an incremental stepped stop-loss close ───────────
+  recordSteppedStopClose(
+    trade: Trade,
+    closedSize: number,
+    exitPrice: number,
+    pnlUSD: number,
+    pnlR: number,
+    newStopLoss: number,
+    stepRatio: number
+  ): void {
+    const pos = this.openPositions.get(trade.id);
+    if (!pos) return;
+
+    pos.size = parseFloat((pos.size - closedSize).toFixed(8));
+    pos.stopLoss = newStopLoss;
+    pos.partialRealizedUSD = parseFloat(((pos.partialRealizedUSD ?? 0) + pnlUSD).toFixed(4));
+    pos.partialRealizedR = parseFloat(((pos.partialRealizedR ?? 0) + pnlR).toFixed(3));
+
+    const stopDist = Math.abs(pos.entryPrice - pos.stopLoss);
+    pos.riskUSD = parseFloat((stopDist * pos.size).toFixed(4));
+    pos.notionalUSD = parseFloat((pos.entryPrice * pos.size).toFixed(4));
+
+    this.updateEquityAndDrawdown();
+    this.saveToDisk();
+  }
+
   // ── Get financial snapshot ─────────────────────────────────
   getFinancialSnapshot(live?: { equity: number; walletBalance: number; availableBalance: number } | number): AccountFinancialSnapshot {
     const liveObj = typeof live === "number"

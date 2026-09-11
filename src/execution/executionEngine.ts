@@ -61,6 +61,20 @@ export class ExecutionEngine {
 
   public onTradeUpdate: ((trade: Trade) => void) | null = null;
   public onPartialProfit: ((trade: Trade, bankedRaw: number, profitPct: number, breakevenPrice: number) => void) | null = null;
+  public onSteppedStopClose: ((
+    trade: Trade,
+    closedSize: number,
+    exitPrice: number,
+    lossRaw: number,
+    stepRatio: number,
+    newStopLoss: number
+  ) => void) | null = null;
+  public onTrailingStopUpdate: ((
+    trade: Trade,
+    peakPrice: number,
+    newStopLoss: number,
+    lockedInRoiPct: number
+  ) => void) | null = null;
   /**
    * Fires whenever a valid strategy signal is blocked by the
    * pre-entry market-regime filter. Used to emit Telegram telemetry.
@@ -186,19 +200,40 @@ export class ExecutionEngine {
       return null;
     }
 
-    // ── 5. Position sizing ─────────────────────────────────
-    const stopDistance = Math.abs(signal.entryPrice - signal.stopLoss);
-    const riskAmount = balance * this.config.riskPerTradePct;
-    const rawSize = riskAmount / stopDistance;
+    // ── 5. Fixed Position Sizing (Rule 1) ──────────────────────
+    // Decoupled from equity scaling and stop distance to prevent ballooning.
+    // Margin is fixed (e.g. $200, capped at $300 max) multiplied by 10x leverage.
+    const targetMargin = (this.config.fixedMarginPerTrade && this.config.fixedMarginPerTrade > 0)
+      ? this.config.fixedMarginPerTrade
+      : 200;
+    const maxMargin = (this.config.maxPositionMargin && this.config.maxPositionMargin > 0)
+      ? this.config.maxPositionMargin
+      : 300;
+    const effectiveMargin = Math.min(targetMargin, maxMargin, balance > 0 ? balance : targetMargin);
+    const leverage = (this.config.leverage && this.config.leverage > 0) ? this.config.leverage : 10;
+    const maxNotional = maxMargin * leverage;
+    const targetNotional = effectiveMargin * leverage;
+    const safeNotional = Math.min(targetNotional, maxNotional);
+    const rawSize = safeNotional / signal.entryPrice;
 
     if (rawSize <= 0 || !isFinite(rawSize)) {
       this.logger.error("[Engine] Calculated size is invalid", {
         rawSize,
-        riskAmount,
-        stopDistance,
+        effectiveMargin,
+        leverage,
+        entryPrice: signal.entryPrice,
       });
       return null;
     }
+
+    this.logger.info("[Engine] Fixed Position Sized (Rule 1)", {
+      marginUSD: effectiveMargin,
+      leverage: `${leverage}x`,
+      notionalUSD: safeNotional,
+      rawSize,
+      symbol: signal.symbol,
+      entryPrice: signal.entryPrice,
+    });
 
     // ── 6. CCXT precision normalization ────────────────────
     const { entry, sl, tp, size } = this.normalizePrecision(
@@ -247,6 +282,9 @@ export class ExecutionEngine {
       notes: `Strategy: ${signal.strategyId} | Flow: ${signal.flow.flow} | Score: ${
         signal.allScores.find((s) => s.strategyId === signal.strategyId)?.score ?? "?"
       }`,
+      steppedStopTranchesFired: [],
+      peakPrice: order.entryPrice,
+      dynamicTrailingStop: undefined,
     };
 
     this.state.openTrades.set(trade.id, trade);
@@ -285,13 +323,33 @@ export class ExecutionEngine {
       const leverage = (this.config.leverage && this.config.leverage > 0) ? this.config.leverage : 10;
       const currentROI = rawPriceChangePct * leverage; // Bybit Position ROI %
 
-      // 1. Check aggressive early partial profit harvest (+0.5% Bybit Position ROI default)
+      // 1. Update peak favorable price for trailing stop tracking
+      const isFavorable = currentROI > 0;
+      if (isFavorable) {
+        const isNewPeak = trade.direction === SignalDirection.LONG
+          ? (trade.peakPrice === undefined || currentPrice > trade.peakPrice)
+          : (trade.peakPrice === undefined || currentPrice < trade.peakPrice);
+        if (isNewPeak) {
+          trade.peakPrice = currentPrice;
+        }
+      }
+
+      // 2. Check aggressive early partial profit harvest (+0.5% Bybit Position ROI default)
       const targetROI = this.config.partialProfitROIPct ?? 0.5;
       if (this.config.enableEarlyPartials && !trade.partialTaken && currentROI >= targetROI) {
         await this.harvestPartial(trade, currentPrice, currentROI, rawPriceChangePct);
       }
 
-      // 2. Check full Stop Loss or Take Profit exit against live price
+      // 3. Dynamic Stop-Loss checks (Rule 3): stepped adverse de-risking + trailing stop
+      // Skip if the trade is already fully closed or is being processed
+      if (this.state.openTrades.has(trade.id)) {
+        await this.checkDynamicStopLoss(trade, currentPrice, currentROI);
+      }
+
+      // 4. Check full Stop Loss or Take Profit exit against live price
+      // (after dynamic checks which may have modified trade.stopLoss)
+      if (!this.state.openTrades.has(trade.id)) continue; // stepped stop may have fully closed it
+
       if (trade.direction === SignalDirection.LONG) {
         if (currentPrice <= trade.stopLoss) {
           this.closeTrade(
@@ -319,6 +377,208 @@ export class ExecutionEngine {
       }
     }
   }
+
+  // ──────────────────────────────────────────────────────────
+  // Private: Dynamic Stop-Loss — Stepped Adverse De-Risking
+  //          & Dynamic Trailing Stop (Rule 3)
+  // ──────────────────────────────────────────────────────────
+
+  private async checkDynamicStopLoss(trade: Trade, currentPrice: number, currentROI: number): Promise<void> {
+    const isLong = trade.direction === SignalDirection.LONG;
+    const originalStopDist = Math.abs(trade.entryPrice - (trade.originalStopLoss ?? trade.stopLoss));
+    if (originalStopDist <= 0) return;
+
+    const leverage = (this.config.leverage && this.config.leverage > 0) ? this.config.leverage : 10;
+
+    // ── A. Stepped Adverse De-Risking ─────────────────────
+    // When price moves adversely by a ratio of the original stop distance,
+    // close a tranche of the position as a reduce-only LIMIT order.
+    if (this.config.enableSteppedStopLoss) {
+      const tranches: number[] = this.config.steppedStopTranches ?? [0.5, 0.75];
+      const trancheClosePct = this.config.steppedStopClosePct ?? 0.5;
+      const firedTranches = trade.steppedStopTranchesFired ?? [];
+
+      // Adverse distance = how far price has moved against us (as ratio of original stop distance)
+      const adverseMove = isLong
+        ? trade.entryPrice - currentPrice  // LONG: price dropped below entry
+        : currentPrice - trade.entryPrice; // SHORT: price rose above entry
+
+      if (adverseMove > 0) {
+        const adverseRatio = adverseMove / originalStopDist;
+
+        for (const trancheRatio of tranches) {
+          if (adverseRatio >= trancheRatio && !firedTranches.includes(trancheRatio)) {
+            // Fire this tranche
+            const rawCloseSize = trade.size * trancheClosePct;
+            let closeSize = rawCloseSize;
+            if (this.exchange.markets?.[trade.symbol]) {
+              closeSize = parseFloat(this.exchange.amountToPrecision(trade.symbol, rawCloseSize));
+            }
+            if (closeSize <= 0) continue;
+
+            const minQty = this.exchange.markets?.[trade.symbol]?.limits?.amount?.min ?? 0;
+            if (minQty > 0 && closeSize < minQty) {
+              this.logger.warn("[Engine] Stepped stop close size below minimum qty — skipping tranche", {
+                closeSize, minQty, symbol: trade.symbol, trancheRatio,
+              });
+              firedTranches.push(trancheRatio); // mark fired to avoid repeat attempts
+              trade.steppedStopTranchesFired = firedTranches;
+              continue;
+            }
+
+            // Close price for limit order: use current stop loss level or the adverse price
+            const closePricePrecision = this.exchange.markets?.[trade.symbol]
+              ? parseFloat(this.exchange.priceToPrecision(trade.symbol, currentPrice))
+              : currentPrice;
+
+            const closeSide: "buy" | "sell" = isLong ? "sell" : "buy";
+            const closeOrderId = await this.executeLimitClose(
+              trade.symbol,
+              closeSide,
+              closeSize,
+              closePricePrecision,
+              `Stepped Stop Tranche (${Math.round(trancheRatio * 100)}% adverse)`
+            );
+
+            const lossRaw = isLong
+              ? (currentPrice - trade.entryPrice) * closeSize
+              : (trade.entryPrice - currentPrice) * closeSize;
+            const lossR = Math.abs(originalStopDist) > 0 ? lossRaw / (originalStopDist * closeSize) : 0;
+
+            // Tighten stop-loss to protect the remaining position
+            // Move to current adverse price (tighter stop than original)
+            const tightenedSl = isLong
+              ? Math.max(trade.stopLoss, currentPrice - originalStopDist * (1 - trancheRatio) * 0.5)
+              : Math.min(trade.stopLoss, currentPrice + originalStopDist * (1 - trancheRatio) * 0.5);
+
+            const newSlPrecision = this.exchange.markets?.[trade.symbol]
+              ? parseFloat(this.exchange.priceToPrecision(trade.symbol, tightenedSl))
+              : tightenedSl;
+
+            // Update Bybit position stop-loss via API
+            await this.applyTrailingStopOnBybit(trade, newSlPrecision);
+
+            // Update trade state
+            firedTranches.push(trancheRatio);
+            trade.steppedStopTranchesFired = firedTranches;
+            trade.size = parseFloat((trade.size - closeSize).toFixed(8));
+            trade.stopLoss = newSlPrecision;
+            trade.order.stopLoss = newSlPrecision;
+            if (trade.partialPnlRaw === undefined) trade.partialPnlRaw = 0;
+            trade.partialPnlRaw = parseFloat((trade.partialPnlRaw + lossRaw).toFixed(4));
+
+            // Record in ledger
+            this.ledger.recordSteppedStopClose(
+              trade, closeSize, currentPrice, lossRaw, lossR, newSlPrecision, trancheRatio
+            );
+
+            this.logger.warn(`⚠️ [Engine] STEPPED STOP TRANCHE FIRED (${Math.round(trancheRatio * 100)}% adverse)`, {
+              id: trade.id.slice(0, 8),
+              symbol: trade.symbol,
+              direction: trade.direction,
+              trancheRatio,
+              closedSize: closeSize,
+              remainingSize: trade.size,
+              lossUSD: lossRaw.toFixed(4),
+              newStopLoss: newSlPrecision,
+              closeOrderId,
+            });
+
+            console.log("\n⚠️ ═══════════════════════════════════════════════════════");
+            console.log(`     STEPPED STOP-LOSS TRANCHE: ${Math.round(trancheRatio * 100)}% ADVERSE`);
+            console.log("⚠️ ═══════════════════════════════════════════════════════");
+            console.log(`Symbol       : ${trade.symbol}`);
+            console.log(`Exit Price   : ${closePricePrecision} (Limit Maker)`);
+            console.log(`Closed Size  : ${closeSize} (${Math.round(trancheClosePct * 100)}% of position)`);
+            console.log(`Realized PnL : -$${Math.abs(lossRaw).toFixed(2)}`);
+            console.log(`Remaining Pos: ${trade.size}`);
+            console.log(`New Stop Loss: ${newSlPrecision} (tightened)`);
+            console.log("⚠️ ═══════════════════════════════════════════════════════\n");
+
+            this.onSteppedStopClose?.(trade, closeSize, currentPrice, lossRaw, trancheRatio, newSlPrecision);
+          }
+        }
+      }
+    }
+
+    // ── B. Dynamic Trailing Stop ───────────────────────────
+    // Activates once ROI reaches trailingStopActivationROI (e.g. +0.5%).
+    // Trails behind the peak favorable price. Ratchets forward only.
+    if (this.config.enableDynamicTrailingStop && trade.peakPrice && trade.peakPrice > 0) {
+      const activationROI = this.config.trailingStopActivationROI ?? 0.5;
+      const trailDistancePct = (this.config.trailingStopDistancePct ?? 0.3) / 100;
+
+      if (currentROI >= activationROI) {
+        // Calculate trail stop behind peak
+        const rawTrailStop = isLong
+          ? trade.peakPrice * (1 - trailDistancePct)
+          : trade.peakPrice * (1 + trailDistancePct);
+
+        const trailStopPrecision = this.exchange.markets?.[trade.symbol]
+          ? parseFloat(this.exchange.priceToPrecision(trade.symbol, rawTrailStop))
+          : rawTrailStop;
+
+        // Only ratchet forward (tighten), never loosen
+        const shouldUpdate = isLong
+          ? trailStopPrecision > trade.stopLoss
+          : trailStopPrecision < trade.stopLoss;
+
+        if (shouldUpdate) {
+          const prevStop = trade.stopLoss;
+          trade.stopLoss = trailStopPrecision;
+          trade.order.stopLoss = trailStopPrecision;
+          trade.dynamicTrailingStop = trailStopPrecision;
+
+          // Calculate locked-in ROI at this trailing stop vs original position
+          const lockedInROI = isLong
+            ? ((trailStopPrecision - trade.entryPrice) / trade.entryPrice) * 100 * leverage
+            : ((trade.entryPrice - trailStopPrecision) / trade.entryPrice) * 100 * leverage;
+
+          // Push updated stop to Bybit exchange
+          await this.applyTrailingStopOnBybit(trade, trailStopPrecision);
+
+          this.logger.info("📈 [Engine] DYNAMIC TRAILING STOP RATCHETED", {
+            id: trade.id.slice(0, 8),
+            symbol: trade.symbol,
+            direction: trade.direction,
+            peakPrice: trade.peakPrice,
+            prevStop,
+            newTrailingStop: trailStopPrecision,
+            lockedInROIPct: lockedInROI.toFixed(2),
+          });
+
+          this.onTrailingStopUpdate?.(trade, trade.peakPrice, trailStopPrecision, lockedInROI);
+        }
+      }
+    }
+  }
+
+  /**
+   * Pushes an updated stop-loss price to the Bybit exchange position via the
+   * V5 TradingStop API. Used by both breakeven shift and dynamic trailing.
+   */
+  private async applyTrailingStopOnBybit(trade: Trade, newStopLoss: number): Promise<void> {
+    const hasApiKey = Boolean(this.exchange.apiKey && this.exchange.apiKey.trim().length > 5);
+    if (!hasApiKey || this.config.paperTrading) return;
+    try {
+      const marketId = (this.exchange.market(trade.symbol)?.id ?? trade.symbol.replace("/", "").split(":")[0]).replace(/[^a-zA-Z0-9]/g, "");
+      if (typeof (this.exchange as any).privatePostV5PositionTradingStop === "function") {
+        await (this.exchange as any).privatePostV5PositionTradingStop({
+          category: "linear",
+          symbol: marketId,
+          stopLoss: newStopLoss.toString(),
+          slTriggerBy: "LastPrice",
+          tpslMode: "Full",
+          positionIdx: 0,
+        });
+        this.logger.info("[Engine] Updated stop-loss on Bybit position", { symbol: marketId, newStopLoss });
+      }
+    } catch (stopErr) {
+      this.logger.warn("[Engine] Could not update position stop-loss on Bybit", { error: String(stopErr) });
+    }
+  }
+
+
 
   // ──────────────────────────────────────────────────────────
   // Public: check open trades against latest candle
@@ -411,37 +671,32 @@ export class ExecutionEngine {
         return;
       }
 
-      // If live trading on Bybit, place reduce-only market order
+      // If live trading on Bybit, place reduce-only LIMIT order (Rule 2: Maker exit)
       const hasApiKey = Boolean(this.exchange.apiKey && this.exchange.apiKey.trim().length > 5);
       if (hasApiKey && !this.config.paperTrading) {
         const side = trade.direction === SignalDirection.LONG ? "sell" : "buy";
-        try {
-          this.logger.info("[Engine] Executing early partial close on Bybit", {
-            symbol: trade.symbol,
-            side,
-            size: closeSize,
-            triggerROI: roiFormatted,
-          });
-          const resp = await this.exchange.createOrder(
-            trade.symbol,
-            "market",
-            side,
-            closeSize,
-            undefined,
-            {
-              reduceOnly: true,
-              positionIdx: 0,
-            }
-          );
-          this.logger.info("[Engine] Bybit early partial filled", { orderId: resp.id, closeSize });
-        } catch (orderErr) {
-          this.logger.error("[Engine] Bybit early partial close failed — aborting state change", {
-            error: String(orderErr),
+        this.logger.info("[Engine] Executing early partial close on Bybit (Limit Maker)", {
+          symbol: trade.symbol,
+          side,
+          size: closeSize,
+          price: currentPrice,
+          triggerROI: roiFormatted,
+        });
+        const closeOrderId = await this.executeLimitClose(
+          trade.symbol,
+          side,
+          closeSize,
+          currentPrice,
+          "Early Partial Profit Harvest"
+        );
+        if (!closeOrderId) {
+          this.logger.error("[Engine] Bybit partial limit close failed — aborting state change", {
             symbol: trade.symbol,
             closeSize,
           });
           return;
         }
+        this.logger.info("[Engine] Bybit early partial limit close placed", { orderId: closeOrderId, closeSize });
       }
 
       // Banked PnL calculations
@@ -464,30 +719,8 @@ export class ExecutionEngine {
         bePrice = parseFloat(this.exchange.priceToPrecision(trade.symbol, bePrice));
       }
 
-      // Update position stop loss on Bybit
-      if (hasApiKey && !this.config.paperTrading) {
-        try {
-          const marketId = (this.exchange.market(trade.symbol)?.id ?? trade.symbol.replace("/", "").split(":")[0]).replace(/[^a-zA-Z0-9]/g, "");
-          if (typeof (this.exchange as any).privatePostV5PositionTradingStop === "function") {
-            await (this.exchange as any).privatePostV5PositionTradingStop({
-              category: "linear",
-              symbol: marketId,
-              stopLoss: bePrice.toString(),
-              slTriggerBy: "LastPrice",
-              tpslMode: "Full",
-              positionIdx: 0,
-            });
-            this.logger.info("[Engine] Shifted Stop Loss to Breakeven on Bybit position", {
-              symbol: marketId,
-              bePrice,
-            });
-          }
-        } catch (stopErr) {
-          this.logger.warn("[Engine] Could not shift position stop loss on Bybit via privatePostV5PositionTradingStop", {
-            error: String(stopErr),
-          });
-        }
-      }
+      // Update position stop loss on Bybit (via shared helper, Rule 2-compatible)
+      await this.applyTrailingStopOnBybit(trade, bePrice);
 
       // Update trade state
       trade.partialTaken = true;
@@ -1175,7 +1408,6 @@ export class ExecutionEngine {
     size: number
   ): Promise<Order | null> {
     const side = signal.direction === SignalDirection.LONG ? "buy" : "sell";
-    const slSide = side === "buy" ? "sell" : "buy";
     const now = Date.now();
 
     const order: Order = {
@@ -1194,25 +1426,74 @@ export class ExecutionEngine {
     };
 
     try {
-      // ── Entry market order with SL/TP attached ────────
-      // Bybit futures requires SL and TP to be set on the
-      // entry order directly, not as separate orders.
-      const entryResp = await this.exchange.createOrder(
-        signal.symbol,
-        "market",
-        side,
-        size,
-        undefined,
-        {
-          stopLoss: sl,
-          takeProfit: tp,
-          slTriggerBy: "LastPrice",
-          tpTriggerBy: "LastPrice",
+      // ── Entry LIMIT order (Rule 2: Maker Only) ────────────
+      // Bybit futures: attach SL/TP on the entry order.
+      // PostOnly ensures Maker (no Taker fee). If the order would
+      // cross the book immediately, Bybit rejects it with ErrCode 10004.
+      // We catch that and fall back to a standard GTC limit order.
+      let entryResp: any;
+      const usePostOnly = this.config.limitOrderPostOnly !== false;
+
+      const baseOrderParams: Record<string, any> = {
+        stopLoss: sl,
+        takeProfit: tp,
+        slTriggerBy: "LastPrice",
+        tpTriggerBy: "LastPrice",
+      };
+
+      if (usePostOnly) {
+        try {
+          this.logger.info("[Engine] Placing PostOnly LIMIT entry (Maker)", {
+            symbol: signal.symbol,
+            side,
+            size,
+            entry,
+            sl,
+            tp,
+          });
+          entryResp = await this.exchange.createOrder(
+            signal.symbol,
+            "limit",
+            side,
+            size,
+            entry,
+            { ...baseOrderParams, timeInForce: "PostOnly" }
+          );
+        } catch (postOnlyErr: any) {
+          // If PostOnly rejected (would cross book) → fall back to GTC limit
+          const errMsg = String(postOnlyErr);
+          const isBookCross = errMsg.includes("10004") || errMsg.includes("postOnly") || errMsg.includes("PostOnly");
+          if (isBookCross) {
+            this.logger.warn("[Engine] PostOnly rejected (book cross) — falling back to GTC limit", {
+              error: errMsg.slice(0, 120),
+            });
+            entryResp = await this.exchange.createOrder(
+              signal.symbol,
+              "limit",
+              side,
+              size,
+              entry,
+              { ...baseOrderParams, timeInForce: "GTC" }
+            );
+          } else {
+            throw postOnlyErr;
+          }
         }
-      );
+      } else {
+        entryResp = await this.exchange.createOrder(
+          signal.symbol,
+          "limit",
+          side,
+          size,
+          entry,
+          { ...baseOrderParams, timeInForce: "GTC" }
+        );
+      }
+
       order.exchangeOrderId = entryResp.id;
-      order.status = OrderStatus.FILLED;
-      order.filledAt = Date.now();
+      // Limit orders start as OPEN (pending fill) not FILLED
+      order.status = OrderStatus.OPEN;
+      order.filledAt = null;
 
       // Fetch real execution details directly from Bybit API
       let actualFillPrice = entryResp.average ?? entryResp.price ?? entry;
@@ -1221,12 +1502,18 @@ export class ExecutionEngine {
       let actualTakeProfit = (entryResp as any).takeProfit ?? tp;
 
       try {
-        await new Promise((r) => setTimeout(r, 250));
+        await new Promise((r) => setTimeout(r, 500));
         const fetched: any = await this.exchange.fetchOrder(entryResp.id, signal.symbol);
         if (fetched) {
           const p = fetched.average ?? fetched.price;
           if (p && p > 0) actualFillPrice = p;
-          if (fetched.filled && fetched.filled > 0) actualFilledSize = fetched.filled;
+          if (fetched.filled && fetched.filled > 0) {
+            actualFilledSize = fetched.filled;
+            order.status = OrderStatus.FILLED;
+            order.filledAt = Date.now();
+          } else if (fetched.status === "open" || fetched.status === "placed") {
+            order.status = OrderStatus.OPEN;
+          }
           const fetchedSl = parseFloat(fetched.stopLoss ?? fetched.info?.stopLoss);
           const fetchedTp = parseFloat(fetched.takeProfit ?? fetched.info?.takeProfit);
           if (fetchedSl && fetchedSl > 0) actualStopLoss = fetchedSl;
@@ -1237,7 +1524,7 @@ export class ExecutionEngine {
       }
 
       order.entryPrice = actualFillPrice;
-      order.size = actualFilledSize;
+      order.size = actualFilledSize > 0 ? actualFilledSize : size;
       order.stopLoss = actualStopLoss;
       order.takeProfit = actualTakeProfit;
 
@@ -1262,25 +1549,28 @@ export class ExecutionEngine {
 
       const rawOrderId = (entryResp.info as any)?.orderId ?? entryResp.id;
       const rawOrderLinkId = (entryResp.info as any)?.orderLinkId;
+      const orderTypeLabel = usePostOnly ? "LIMIT (PostOnly Maker)" : "LIMIT (GTC)";
 
       console.log("\n═════════════════════════════════════════════════════");
-      console.log("             BYBIT LIVE ORDER PLACED                 ");
+      console.log(`             BYBIT LIVE ${orderTypeLabel} ORDER PLACED        `);
       console.log("═════════════════════════════════════════════════════");
       console.log("CCXT entryResp.id  :", entryResp.id);
       console.log("Order ID (slice-8) :", (rawOrderId ?? "").slice(-8));
       console.log("TP / SL Order IDs  :", `${order.bybitTpId ?? "—"} / ${order.bybitSlId ?? "—"}`);
       console.log("Fill Price (Bybit) :", order.entryPrice);
       console.log("Filled Size (Bybit):", order.size);
+      console.log("Order Status       :", order.status);
       console.log("Full Bybit response:", JSON.stringify(entryResp.info ?? entryResp, null, 2));
       console.log("═════════════════════════════════════════════════════\n");
 
-      this.logger.info("[Engine] Live order placed", {
+      this.logger.info("[Engine] Live limit order placed", {
         entryOrderId: entryResp.id,
         bybitOrderId: (rawOrderId ?? "").slice(-8),
         tpId: order.bybitTpId,
         slId: order.bybitSlId,
         fillPrice: order.entryPrice,
         size: order.size,
+        status: order.status,
         sl: order.stopLoss,
         tp: order.takeProfit,
       });
@@ -1292,6 +1582,66 @@ export class ExecutionEngine {
     }
 
     return order;
+  }
+
+  /**
+   * Places a reduce-only LIMIT close order on Bybit (Rule 2: Maker exits).
+   * Used for: partial profit harvests, stepped stop tranches, and trailing stop hits.
+   * Returns the Bybit order ID on success or null on failure.
+   */
+  private async executeLimitClose(
+    symbol: string,
+    side: "buy" | "sell",
+    size: number,
+    price: number,
+    reason: string
+  ): Promise<string | null> {
+    try {
+      const hasApiKey = Boolean(this.exchange.apiKey && this.exchange.apiKey.trim().length > 5);
+      if (!hasApiKey || this.config.paperTrading) return "PAPER";
+
+      let resp: any;
+      try {
+        resp = await this.exchange.createOrder(
+          symbol,
+          "limit",
+          side,
+          size,
+          price,
+          { reduceOnly: true, positionIdx: 0, timeInForce: "PostOnly" }
+        );
+      } catch (postErr: any) {
+        const errMsg = String(postErr);
+        const isBookCross = errMsg.includes("10004") || errMsg.includes("postOnly") || errMsg.includes("PostOnly");
+        if (isBookCross) {
+          this.logger.warn(`[Engine] ${reason}: PostOnly close rejected — falling back to GTC limit`, {
+            error: errMsg.slice(0, 100),
+          });
+          resp = await this.exchange.createOrder(
+            symbol,
+            "limit",
+            side,
+            size,
+            price,
+            { reduceOnly: true, positionIdx: 0, timeInForce: "GTC" }
+          );
+        } else {
+          throw postErr;
+        }
+      }
+
+      this.logger.info(`[Engine] ${reason}: Limit close order placed on Bybit`, {
+        orderId: resp.id,
+        symbol,
+        side,
+        size,
+        price,
+      });
+      return resp.id ?? null;
+    } catch (err) {
+      this.logger.error(`[Engine] ${reason}: Limit close order failed`, { error: String(err), symbol, size, price });
+      return null;
+    }
   }
 
   // ──────────────────────────────────────────────────────────

@@ -134,6 +134,59 @@ export class TelegramNotifier {
     sendMessage(this.token, this.chatId, msg);
   }
 
+  notifySteppedStopClose(params: {
+    id: string;
+    symbol: string;
+    direction: string;
+    exitPrice: number;
+    closedSize: number;
+    remainingSize: number;
+    lossRaw: number;
+    stepRatio: number;
+    newStopLoss: number;
+    strategy: string;
+  }): void {
+    if (!this.enabled) return;
+
+    const msg =
+      `⚠️ <b>STEPPED STOP-LOSS TRANCHE EXECUTED (${Math.round(params.stepRatio * 100)}% Adverse)</b>\n\n` +
+      `Strategy     : ${params.strategy}\n` +
+      `Symbol       : ${params.symbol} (${params.direction})\n` +
+      `Exit Price   : ${params.exitPrice} (Limit Order Maker)\n` +
+      `Closed Size  : ${params.closedSize}\n` +
+      `Remaining Pos: ${params.remainingSize}\n` +
+      `Realized PnL : -$${Math.abs(params.lossRaw).toFixed(4)}\n` +
+      `New Stop Loss: ${params.newStopLoss}\n\n` +
+      `Action       : <b>De-risked position early to avoid full blowout 🛡️</b>\n` +
+      `Bot ID       : ${params.id.slice(0, 8)}`;
+
+    sendMessage(this.token, this.chatId, msg);
+  }
+
+  notifyTrailingStopUpdate(params: {
+    id: string;
+    symbol: string;
+    direction: string;
+    peakPrice: number;
+    newStopLoss: number;
+    lockedInRoiPct: number;
+    strategy: string;
+  }): void {
+    if (!this.enabled) return;
+
+    const msg =
+      `📈 <b>DYNAMIC TRAILING STOP ADJUSTED</b>\n\n` +
+      `Strategy     : ${params.strategy}\n` +
+      `Symbol       : ${params.symbol} (${params.direction})\n` +
+      `Peak Price   : ${params.peakPrice}\n` +
+      `New Stop Loss: <b>${params.newStopLoss}</b> (Trailing)\n` +
+      `Locked-in ROI: +${params.lockedInRoiPct.toFixed(2)}%\n\n` +
+      `Status       : <b>Gains locked in 🛡️</b>\n` +
+      `Bot ID       : ${params.id.slice(0, 8)}`;
+
+    sendMessage(this.token, this.chatId, msg);
+  }
+
   notifyTradeClose(params: {
     id: string;
     exchangeOrderId?: string | null;

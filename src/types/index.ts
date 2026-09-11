@@ -204,6 +204,10 @@ export interface Trade {
   durationMs: number | null;
   indicators: IndicatorSnapshot;
   notes: string;
+  // ── Dynamic & Stepped Stop-Loss Tracking ──
+  steppedStopTranchesFired?: number[]; // indices or ratios of adverse steps already triggered (e.g. [0.5, 0.75])
+  peakPrice?: number;                 // highest favorable price reached during trade
+  dynamicTrailingStop?: number;       // active trailing stop price
 }
 
 // ------------------------------------------------------------
@@ -231,8 +235,20 @@ export interface EvaluationRecord {
 export interface BotConfig {
   symbol: string;
   timeframe: string;          // "5m"
-  riskPerTradePct: number;    // e.g. 0.001 = 0.1% of account
+  riskPerTradePct: number;    // fallback risk % (deprecated in favor of fixed margin)
   leverage: number;           // e.g. 10 for 10x leverage
+  // ── Fixed Position Sizing (Rule 1) ─────────────────────────
+  fixedMarginPerTrade: number; // e.g. $300 margin (range $200-$500)
+  maxPositionMargin: number;   // hard cap: max $500 margin per trade
+  // ── Limit Orders Only (Rule 2) ─────────────────────────────
+  limitOrderPostOnly: boolean; // true = force Maker via PostOnly, preventing Taker fees
+  // ── Dynamic Stop-Loss & Incremental Closing (Rule 3) ───────
+  enableSteppedStopLoss: boolean;       // true = close portions incrementally on adverse move
+  steppedStopTranches: number[];         // adverse distance ratios e.g. [0.5, 0.75]
+  steppedStopClosePct: number;           // fraction of current size to close per tranche (e.g. 0.5)
+  enableDynamicTrailingStop: boolean;   // true = trail stop tightly behind favorable peak
+  trailingStopActivationROI: number;    // minimum ROI % to activate trailing (e.g. 0.5)
+  trailingStopDistancePct: number;      // price distance % to trail behind peak (e.g. 0.3)
   riskRewardRatio: number;    // 2
   atrMultiplierSL: number;    // e.g. 1.5 × ATR for stop distance
   sessionStartUTC: number;    // 13 (13:00 UTC)

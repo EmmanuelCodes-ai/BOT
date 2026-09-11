@@ -27,6 +27,16 @@ function makeConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     enablePreEntryFilters: true,
     minBollingerBandwidth: 0.0025,
     minATRExpansionRatio: 0.85,
+    // ── Rule 1-3 defaults for test ─────────────────────────
+    fixedMarginPerTrade: 200,
+    maxPositionMargin: 300,
+    limitOrderPostOnly: true,
+    enableSteppedStopLoss: true,
+    steppedStopTranches: [0.5, 0.75],
+    steppedStopClosePct: 0.5,
+    enableDynamicTrailingStop: true,
+    trailingStopActivationROI: 0.5,
+    trailingStopDistancePct: 0.3,
     ...overrides,
   };
 }

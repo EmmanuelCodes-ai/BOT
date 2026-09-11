@@ -89,6 +89,27 @@ function loadConfig(): BotConfig {
     enablePreEntryFilters: process.env.ENABLE_PRE_ENTRY_FILTERS !== "false",
     minBollingerBandwidth: parseFloat(process.env.MIN_BOLLINGER_BANDWIDTH ?? "0.0025"),
     minATRExpansionRatio: parseFloat(process.env.MIN_ATR_EXPANSION_RATIO ?? "0.85"),
+    // ── Fixed Position Sizing (Rule 1) ─────────────────────────
+    // Decoupled from equity. Every trade uses fixedMarginPerTrade × leverage.
+    fixedMarginPerTrade: (() => {
+      const maxMargin = parseFloat(process.env.MAX_POSITION_MARGIN ?? "300");
+      const raw = parseFloat(process.env.FIXED_MARGIN_PER_TRADE ?? "200");
+      return Math.max(50, Math.min(raw, maxMargin)); // Clamp: $50 minimum, maxMargin maximum
+    })(),
+    maxPositionMargin: parseFloat(process.env.MAX_POSITION_MARGIN ?? "300"),
+    // ── Limit Orders Only (Rule 2) ─────────────────────────────
+    // true = PostOnly Maker entries/exits (falls back to GTC if book-crossing)
+    limitOrderPostOnly: process.env.LIMIT_ORDER_POST_ONLY !== "false",
+    // ── Dynamic Stop-Loss & Incremental Closing (Rule 3) ───────
+    enableSteppedStopLoss: process.env.ENABLE_STEPPED_STOP_LOSS !== "false",
+    steppedStopTranches: (() => {
+      const raw = process.env.STEPPED_STOP_TRANCHES ?? "0.5,0.75";
+      return raw.split(",").map((v) => parseFloat(v.trim())).filter((v) => !isNaN(v) && v > 0 && v < 1);
+    })(),
+    steppedStopClosePct: parseFloat(process.env.STEPPED_STOP_CLOSE_PCT ?? "0.5"),
+    enableDynamicTrailingStop: process.env.ENABLE_DYNAMIC_TRAILING_STOP !== "false",
+    trailingStopActivationROI: parseFloat(process.env.TRAILING_STOP_ACTIVATION_ROI ?? "0.5"),
+    trailingStopDistancePct: parseFloat(process.env.TRAILING_STOP_DISTANCE_PCT ?? "0.3"),
   };
 }
 
@@ -335,6 +356,51 @@ class TradingBot {
         minATRExpansionRatio: thresholds.minATR,
         isStrategyAware,
       });
+    };
+
+    // Wire stepped stop-loss tranche closes to Telegram + AI analyst
+    this.engine.onSteppedStopClose = (trade, closedSize, exitPrice, lossRaw, stepRatio, newStopLoss) => {
+      this.telegram.notifySteppedStopClose({
+        id: trade.id,
+        symbol: trade.symbol,
+        direction: trade.direction,
+        exitPrice,
+        closedSize,
+        remainingSize: trade.size,
+        lossRaw,
+        stepRatio,
+        newStopLoss,
+        strategy: trade.strategyId,
+      });
+
+      if (this.analyst.isEnabled()) {
+        this.telegram.notifyAnalyst(
+          `⚠️ <b>Stepped Stop Triggered (${Math.round(stepRatio * 100)}% adverse):</b> ` +
+          `Closed ${closedSize} of ${trade.symbol} at $${exitPrice.toFixed(2)} (realized -$${Math.abs(lossRaw).toFixed(2)}). ` +
+          `Remaining size: ${trade.size}. New SL: ${newStopLoss}. ` +
+          `Incremental de-risking engaged to avoid full stop-out.`
+        );
+      }
+    };
+
+    // Wire dynamic trailing stop ratchet updates to Telegram + AI analyst
+    this.engine.onTrailingStopUpdate = (trade, peakPrice, newStopLoss, lockedInRoiPct) => {
+      this.telegram.notifyTrailingStopUpdate({
+        id: trade.id,
+        symbol: trade.symbol,
+        direction: trade.direction,
+        peakPrice,
+        newStopLoss,
+        lockedInRoiPct,
+        strategy: trade.strategyId,
+      });
+
+      if (this.analyst.isEnabled() && lockedInRoiPct > 0.1) {
+        this.telegram.notifyAnalyst(
+          `📈 <b>Trailing Stop Ratcheted:</b> ${trade.symbol} peak at $${peakPrice.toFixed(2)}. ` +
+          `Stop locked at $${newStopLoss.toFixed(2)} — protecting +${lockedInRoiPct.toFixed(2)}% ROI.`
+        );
+      }
     };
   }
 
