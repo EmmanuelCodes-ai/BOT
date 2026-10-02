@@ -208,6 +208,36 @@ export interface Trade {
   steppedStopTranchesFired?: number[]; // indices or ratios of adverse steps already triggered (e.g. [0.5, 0.75])
   peakPrice?: number;                 // highest favorable price reached during trade
   dynamicTrailingStop?: number;       // active trailing stop price
+  // ── Adaptive Aggression & Profit-Lock Tracking ──
+  aggressionMode?: AggressionMode;
+  modeRationale?: string;
+}
+
+// ------------------------------------------------------------
+// Autonomous Aggression Tiers & Risk Governance
+// ------------------------------------------------------------
+
+export enum AggressionMode {
+  GROWTH = "GROWTH",           // Mode A: Green Zone — Compounding, scaling up position sizing
+  DEFENSE = "DEFENSE",         // Mode B: Yellow Zone — Selective, minimal/baseline risk, capital preservation
+  PROFIT_LOCK = "PROFIT_LOCK", // Mode C: Red Zone — Session profit secured or consecutive loss circuit breaker, stand down
+}
+
+export interface AdaptiveRiskDecision {
+  mode: AggressionMode;
+  approved: boolean;
+  targetMarginUSD: number;
+  reason: string;
+  accountState: {
+    sessionPnLUSD: number;
+    sessionPnLR: number;
+    peakEquityUSD: number;
+    currentEquityUSD: number;
+    drawdownFromPeakUSD: number;
+    drawdownFromPeakPct: number;
+    consecutiveLosses: number;
+    consecutiveWins: number;
+  };
 }
 
 // ------------------------------------------------------------
@@ -270,6 +300,12 @@ export interface BotConfig {
   enablePreEntryFilters: boolean;   // master switch (default true)
   minBollingerBandwidth: number;    // min BB bandwidth to confirm expansion (default 0.0025)
   minATRExpansionRatio: number;     // atr14/avgATR50 minimum ratio (default 0.85)
+  // ── Autonomous Adaptive Aggression & Profit-Hunting ────────
+  enableAdaptiveAggression?: boolean;      // master switch for dynamic modes (default true)
+  sessionProfitTargetUSD?: number;         // Mode C trigger: session profit target to lock in (e.g. $1000 or $500)
+  maxConsecutiveLossesStandDown?: number;  // Mode C trigger: consecutive losses before locking and standing down (default 2)
+  maxDrawdownFromPeakStandDownPct?: number;// Mode C trigger: drawdown % from session high-water mark before standing down (default 5.0)
+  growthModeMinScore?: number;             // Minimum strategy score for growth mode scaling (default 75)
 }
 
 // ------------------------------------------------------------

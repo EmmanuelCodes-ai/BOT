@@ -110,6 +110,12 @@ function loadConfig(): BotConfig {
     enableDynamicTrailingStop: process.env.ENABLE_DYNAMIC_TRAILING_STOP !== "false",
     trailingStopActivationROI: parseFloat(process.env.TRAILING_STOP_ACTIVATION_ROI ?? "0.5"),
     trailingStopDistancePct: parseFloat(process.env.TRAILING_STOP_DISTANCE_PCT ?? "0.3"),
+    // ── Autonomous Adaptive Aggression & Profit-Hunting ────────
+    enableAdaptiveAggression: process.env.ENABLE_ADAPTIVE_AGGRESSION !== "false",
+    sessionProfitTargetUSD: parseFloat(process.env.SESSION_PROFIT_TARGET_USD ?? "500"),
+    maxConsecutiveLossesStandDown: parseInt(process.env.MAX_CONSECUTIVE_LOSSES_STAND_DOWN ?? "2", 10),
+    maxDrawdownFromPeakStandDownPct: parseFloat(process.env.MAX_DRAWDOWN_FROM_PEAK_STAND_DOWN_PCT ?? "5.0"),
+    growthModeMinScore: parseFloat(process.env.GROWTH_MODE_MIN_SCORE ?? "75"),
   };
 }
 
@@ -217,6 +223,25 @@ function isMidnightWAT(): boolean {
   return now.getUTCHours() === 23 && now.getUTCMinutes() === 0;
 }
 
+/**
+ * Sunday 23:59 UTC — fires the weekly summary.
+ * Using 23:59 (one minute before midnight) keeps it distinct
+ * from the daily 23:00 UTC summary.
+ */
+function isSundayWeeklySummaryTime(): boolean {
+  const now = new Date();
+  return now.getUTCDay() === 0 && now.getUTCHours() === 23 && now.getUTCMinutes() === 59;
+}
+
+/**
+ * 1st of every month at 00:01 UTC — fires the monthly summary.
+ * One minute past midnight gives a clean "start of new month" feel.
+ */
+function isFirstOfMonthSummaryTime(): boolean {
+  const now = new Date();
+  return now.getUTCDate() === 1 && now.getUTCHours() === 0 && now.getUTCMinutes() === 1;
+}
+
 // ============================================================
 // 6. Main TradingBot class
 // ============================================================
@@ -232,6 +257,8 @@ class TradingBot {
   private poller: TelegramPoller | null = null;
   private lastProcessedCandleTs: number = 0;
   private dailySummaryFiredDate: string = "";
+  private weeklySummaryFiredDate: string = "";   // YYYY-WW (ISO week)
+  private monthlySummaryFiredMonth: string = ""; // YYYY-MM
   private running: boolean = false;
 
   private latestCandles: Candle[] = [];
@@ -355,6 +382,30 @@ class TradingBot {
         atrExpansionRatio: signal.indicators.atrExpansionRatio,
         minATRExpansionRatio: thresholds.minATR,
         isStrategyAware,
+      });
+    };
+
+    // Wire autonomous adaptive risk decisions to Telegram transparency telemetry
+    this.engine.onAdaptiveRiskDecision = (decision, signal, allocatedMargin) => {
+      const score = signal.allScores?.find((s) => s.strategyId === signal.strategyId)?.score ?? 0;
+      this.telegram.notifyAdaptiveRiskDecision({
+        mode: decision.mode,
+        approved: decision.approved,
+        allocatedMarginUSD: allocatedMargin,
+        reason: decision.reason,
+        strategy: signal.strategyId,
+        direction: signal.direction,
+        symbol: signal.symbol,
+        score,
+        flow: signal.flow.flow,
+        macroBias: signal.flow.macroBias,
+        rsi: signal.indicators.rsi14,
+        sessionPnLUSD: decision.accountState.sessionPnLUSD,
+        sessionPnLR: decision.accountState.sessionPnLR,
+        peakEquityUSD: decision.accountState.peakEquityUSD,
+        drawdownPct: decision.accountState.drawdownFromPeakPct,
+        consecutiveWins: decision.accountState.consecutiveWins,
+        consecutiveLosses: decision.accountState.consecutiveLosses,
       });
     };
 
@@ -502,15 +553,102 @@ class TradingBot {
             }).join("\n");
           await this.poller!.sendMessage(id, msg);
 
+        } else if (command === "/trades" || command === "/positions") {
+          const openTrades = this.engine.getOpenTrades();
+          const closedTrades = this.engine.getClosedTrades();
+          const bal = this.engine.getLatestBalanceInfo();
+
+          let openText = "None (0 active)";
+          if (openTrades.length > 0) {
+            openText = openTrades.map((t) => {
+              const modeTag = t.aggressionMode ? ` [${t.aggressionMode}]` : "";
+              return `• <b>${t.direction} ${t.symbol}</b>${modeTag}\n  Entry: $${t.entryPrice} | SL: $${t.stopLoss} | TP: $${t.takeProfit}\n  Size: ${t.size} | Strat: ${t.strategyId}`;
+            }).join("\n\n");
+          }
+
+          let recentClosedText = "No trades closed yet.";
+          if (closedTrades.length > 0) {
+            recentClosedText = closedTrades.slice(-5).reverse().map((t) => {
+              const sign = (t.pnlRaw ?? 0) >= 0 ? "+" : "";
+              const emoji = t.outcome === "WIN" ? "✅" : (t.outcome === "LOSS" ? "❌" : "🛡️");
+              return `${emoji} ${t.direction} ${t.strategyId} → ${sign}$${(t.pnlRaw ?? 0).toFixed(2)} (${sign}${(t.pnlR ?? 0).toFixed(2)}R)`;
+            }).join("\n");
+          }
+
+          const msg =
+            `📋 <b>Trade Portfolio & Logs</b>\n\n` +
+            `<b>Open Positions (${openTrades.length}):</b>\n${openText}\n\n` +
+            `<b>Recent Closed Trades:</b>\n${recentClosedText}\n\n` +
+            `Total Equity: $${bal.equity.toFixed(2)}`;
+          await this.poller!.sendMessage(id, msg);
+
+        } else if (command === "/pnl" || command === "/mode") {
+          const fin = this.engine.getLedger().getFinancialSnapshot();
+          const closed = this.engine.getClosedTrades();
+          const sessionPnL = closed.reduce((acc, t) => acc + (t.pnlRaw ?? 0), 0);
+          const sessionR = closed.reduce((acc, t) => acc + (t.pnlR ?? 0), 0);
+
+          let consecutiveWins = 0;
+          let consecutiveLosses = 0;
+          for (let i = closed.length - 1; i >= 0; i--) {
+            if (closed[i].outcome === "WIN") {
+              if (consecutiveLosses === 0) consecutiveWins++;
+              else break;
+            } else if (closed[i].outcome === "LOSS") {
+              if (consecutiveWins === 0) consecutiveLosses++;
+              else break;
+            }
+          }
+
+          let currentTier = "MODE B: DEFENSE (Yellow Zone)";
+          let tierEmoji = "🛡️";
+          if (sessionPnL >= (this.config.sessionProfitTargetUSD ?? 500) || consecutiveLosses >= (this.config.maxConsecutiveLossesStandDown ?? 2)) {
+            currentTier = "MODE C: PROFIT-LOCK & STAND DOWN (Red Zone)";
+            tierEmoji = "🔒";
+          } else if (sessionPnL > 0 || consecutiveWins >= 1) {
+            currentTier = "MODE A: GROWTH / PROFIT-HUNTING (Green Zone)";
+            tierEmoji = "🚀";
+          }
+
+          const pnlSign = sessionPnL >= 0 ? "+" : "";
+          const msg =
+            `${tierEmoji} <b>Autonomous Aggression & Profit Status</b>\n\n` +
+            `<b>Active Stance:</b> ${currentTier}\n\n` +
+            `• Session Realized PnL: ${pnlSign}$${sessionPnL.toFixed(2)} (${pnlSign}${sessionR.toFixed(2)}R)\n` +
+            `• Total Equity        : $${fin.totalEquityUSD.toFixed(2)}\n` +
+            `• Peak High-Water Mark: $${fin.peakEquityUSD.toFixed(2)}\n` +
+            `• Current Drawdown    : $${fin.currentDrawdownUSD.toFixed(2)} (${fin.currentDrawdownPct.toFixed(1)}%)\n` +
+            `• Streak State        : ${consecutiveWins > 0 ? `${consecutiveWins}W streak` : (consecutiveLosses > 0 ? `${consecutiveLosses}L streak` : "Neutral")}\n` +
+            `• Win Rate            : ${fin.winRatePct}% (${fin.winningTrades}W / ${fin.losingTrades}L / ${fin.breakevenTrades}BE)\n` +
+            `• Profit Target       : $${this.config.sessionProfitTargetUSD ?? 500}`;
+          await this.poller!.sendMessage(id, msg);
+
+        } else if (command === "/weekly") {
+          const liveEquity = this.engine.getLatestBalanceInfo().equity;
+          const summary = this.engine.getLedger().getWeeklySummary(liveEquity);
+          this.telegram.notifyPeriodSummary(summary);
+          await this.poller!.sendMessage(id, "📅 Weekly report sent above ↑");
+
+        } else if (command === "/monthly") {
+          const liveEquity = this.engine.getLatestBalanceInfo().equity;
+          const summary = this.engine.getLedger().getMonthlySummary(liveEquity);
+          this.telegram.notifyPeriodSummary(summary);
+          await this.poller!.sendMessage(id, "🗓️ Monthly report sent above ↑");
+
         } else if (command === "/help") {
           await this.poller!.sendMessage(id,
-            `🤖 <b>Bot Commands</b>\n\n` +
+            `🤖 <b>Trade Commander Commands</b>\n\n` +
+            `/mode — View current aggression mode & profit state\n` +
+            `/trades — View active positions & recent trade logs\n` +
+            `/pnl — Financial ledger & session performance\n` +
+            `/weekly — 7-day rolling performance breakdown\n` +
+            `/monthly — Current calendar month performance report\n` +
+            `/status — Live price, balance & system status\n` +
             `/pause — Pause automated strategy trades\n` +
             `/resume — Resume automated strategy trades\n` +
-            `/status — Current price, balance & trade status\n` +
-            `/keys — View unified AI key pool status & health\n` +
+            `/keys — View unified AI key pool status\n` +
             `/help — Show this menu\n\n` +
-            `Or just type any question to chat with the AI analyst.`
+            `Or ask any question to chat with the Autonomous Trade Commander.`
           );
 
         } else {
@@ -570,6 +708,16 @@ class TradingBot {
     // Read-only: closed trades only, open positions untouched.
     if (isMidnightWAT()) {
       await this.fireDailySummary();
+    }
+
+    // ── Weekly summary — Sunday at 23:59 UTC ──────────────────
+    if (isSundayWeeklySummaryTime()) {
+      await this.fireWeeklySummary();
+    }
+
+    // ── Monthly summary — 1st of month at 00:01 UTC ───────────
+    if (isFirstOfMonthSummaryTime()) {
+      await this.fireMonthlySummary();
     }
 
     // ── Live ticker & position synchronization (runs every 15s) ──
@@ -788,6 +936,114 @@ class TradingBot {
     this.telegram.notifyError(
       `📋 <b>Open Positions at midnight WAT</b>\n${summary}\n\n<i>These positions were not modified.</i>`
     );
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Automated: Weekly Summary — Sunday 23:59 UTC
+  // Deduplication key: ISO week string (YYYY-WW)
+  // ──────────────────────────────────────────────────────────
+
+  private async fireWeeklySummary(force: boolean = false): Promise<void> {
+    const now = new Date();
+    // ISO week: YYYY-WW derived from the Sunday date
+    const weekKey = `${now.getUTCFullYear()}-W${this.getISOWeek(now).toString().padStart(2, "0")}`;
+
+    if (!force && this.weeklySummaryFiredDate === weekKey) return;
+    this.weeklySummaryFiredDate = weekKey;
+
+    const liveEquity = await this.engine.getCurrentBalanceAsync().catch(() => 0);
+    const summary = this.engine.getLedger().getWeeklySummary(liveEquity || undefined);
+
+    this.telegram.notifyPeriodSummary(summary);
+
+    this.logger.info("Weekly summary fired", {
+      week: weekKey,
+      trades: summary.totalTrades,
+      netPnLUSD: summary.netPnLUSD,
+    });
+
+    // AI weekly narrative
+    if (this.analyst.isEnabled() && summary.totalTrades > 0) {
+      const ctx = this.buildContext();
+      this.analyst.chat(
+        `Provide a concise weekly performance review. This week: ${summary.wins}W / ${summary.losses}L, ` +
+        `Net PnL ${summary.netPnLUSD >= 0 ? "+" : ""}$${summary.netPnLUSD.toFixed(2)} ` +
+        `(${summary.totalR >= 0 ? "+" : ""}${summary.totalR.toFixed(2)}R), ` +
+        `win rate ${summary.winRatePct.toFixed(1)}%, profit factor ${summary.profitFactor === 999 ? "∞" : summary.profitFactor.toFixed(2)}. ` +
+        `Highlight the key strengths and one area to improve. Keep under 150 words.`,
+        ctx
+      ).then((insight) => {
+        if (insight) this.telegram.notifyAnalyst(`🤖 <b>AI Weekly Review:</b>\n\n${insight}`);
+      }).catch(() => {});
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Automated: Monthly Summary — 1st of month 00:01 UTC
+  // Deduplication key: YYYY-MM of the PREVIOUS month
+  // ──────────────────────────────────────────────────────────
+
+  private async fireMonthlySummary(force: boolean = false): Promise<void> {
+    const now = new Date();
+    // On the 1st, we want last month's key for deduplication
+    const prevMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+    const monthKey = `${prevMonth.getUTCFullYear()}-${String(prevMonth.getUTCMonth() + 1).padStart(2, "0")}`;
+
+    if (!force && this.monthlySummaryFiredMonth === monthKey) return;
+    this.monthlySummaryFiredMonth = monthKey;
+
+    const liveEquity = await this.engine.getCurrentBalanceAsync().catch(() => 0);
+    // Summary for the previous calendar month
+    const prevMonthStart = new Date(Date.UTC(prevMonth.getUTCFullYear(), prevMonth.getUTCMonth(), 1));
+    const prevMonthEnd   = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)); // exclusive
+    const closedThisMonth = this.engine.getLedger().getClosedTrades().filter(
+      (t) => t.closedAt >= prevMonthStart.getTime() && t.closedAt < prevMonthEnd.getTime()
+    );
+
+    // Build a custom label for the previous month
+    const monthName = prevMonth.toLocaleString("en-US", { month: "long", year: "numeric", timeZone: "UTC" });
+    // Re-use the weekly path but fetch the correct summary object
+    const summary = this.engine.getLedger().getMonthlySummary(liveEquity || undefined);
+    // Override label for clarity
+    const patchedSummary = {
+      ...summary,
+      label: `Monthly (${monthName})`,
+      periodStart: prevMonthStart.toISOString().slice(0, 10),
+      periodEnd: new Date(prevMonthEnd.getTime() - 1).toISOString().slice(0, 10),
+    };
+
+    this.telegram.notifyPeriodSummary(patchedSummary);
+
+    this.logger.info("Monthly summary fired", {
+      month: monthKey,
+      trades: summary.totalTrades,
+      netPnLUSD: summary.netPnLUSD,
+    });
+
+    // AI monthly narrative
+    if (this.analyst.isEnabled() && summary.totalTrades > 0) {
+      const ctx = this.buildContext();
+      this.analyst.chat(
+        `Provide a concise monthly performance review for ${monthName}. ` +
+        `${summary.wins}W / ${summary.losses}L, Net PnL ${summary.netPnLUSD >= 0 ? "+" : ""}$${summary.netPnLUSD.toFixed(2)} ` +
+        `(${summary.totalR >= 0 ? "+" : ""}${summary.totalR.toFixed(2)}R), win rate ${summary.winRatePct.toFixed(1)}%, ` +
+        `profit factor ${summary.profitFactor === 999 ? "∞" : summary.profitFactor.toFixed(2)}, ` +
+        `max intra-month drawdown ${summary.maxDrawdownPct.toFixed(2)}%. ` +
+        `Summarize performance and give one strategic recommendation for next month. Under 180 words.`,
+        ctx
+      ).then((insight) => {
+        if (insight) this.telegram.notifyAnalyst(`🤖 <b>AI Monthly Review:</b>\n\n${insight}`);
+      }).catch(() => {});
+    }
+  }
+
+  /** Returns the ISO week number (1-53) for a given Date. */
+  private getISOWeek(date: Date): number {
+    const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+    const dayNum = d.getUTCDay() || 7;
+    d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    return Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
   }
 
   private buildContext(): BotContext {

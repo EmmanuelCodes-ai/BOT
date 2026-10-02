@@ -56,6 +56,40 @@ export interface ClosedTradeLedgerEntry {
   notes: string;
 }
 
+// ------------------------------------------------------------
+// Period Performance Summary (Weekly / Monthly)
+// ------------------------------------------------------------
+
+export interface PeriodTradeSummary {
+  pnlUSD: number;
+  pnlR: number;
+  strategy: string;
+  direction: string;
+  outcome: string;
+  durationMinutes: number;
+}
+
+export interface PeriodSummary {
+  label: string;                     // "Weekly" or "Monthly"
+  periodStart: string;               // ISO date string (YYYY-MM-DD)
+  periodEnd: string;                 // ISO date string (YYYY-MM-DD)
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  breakevens: number;
+  winRatePct: number;                // wins / (wins+losses) * 100
+  netPnLUSD: number;                 // sum of all realizedPnLUSD in period
+  netPnLPct: number;                 // netPnL / startingEquity * 100
+  totalR: number;                    // sum of realizedPnLR in period
+  avgR: number;                      // totalR / totalTrades
+  profitFactor: number;              // grossProfit / grossLoss
+  bestTrade: PeriodTradeSummary | null;
+  worstTrade: PeriodTradeSummary | null;
+  maxDrawdownPct: number;            // max intra-period peak-to-trough drawdown
+  startingEquityUSD: number;         // equity at period start
+  endingEquityUSD: number;           // equity at period end (live or calculated)
+}
+
 export interface AccountFinancialSnapshot {
   startingBalanceUSD: number;
   cashBalanceUSD: number;
@@ -373,6 +407,146 @@ export class TradeLedger {
 
   getClosedTrades(): ClosedTradeLedgerEntry[] {
     return this.closedTrades;
+  }
+
+  // ── Period performance summaries ───────────────────────────
+
+  /**
+   * Aggregates all trades closed within the last 7 rolling days
+   * into a PeriodSummary. Pass the current live equity so the
+   * ending balance reflects the real account state.
+   */
+  getWeeklySummary(liveEquity?: number): PeriodSummary {
+    const now = Date.now();
+    const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
+    const startDate = new Date(weekAgo).toISOString().slice(0, 10);
+    const endDate   = new Date(now).toISOString().slice(0, 10);
+    const trades = this.closedTrades.filter((t) => t.closedAt >= weekAgo);
+    return this.buildPeriodSummary("Weekly (Last 7 Days)", startDate, endDate, trades, liveEquity);
+  }
+
+  /**
+   * Aggregates all trades closed within the current calendar month
+   * (UTC) into a PeriodSummary.
+   */
+  getMonthlySummary(liveEquity?: number): PeriodSummary {
+    const now = new Date();
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
+    const startDate = monthStart.toISOString().slice(0, 10);
+    const endDate   = now.toISOString().slice(0, 10);
+    const trades = this.closedTrades.filter((t) => t.closedAt >= monthStart.getTime());
+    const monthName = now.toLocaleString("en-US", { month: "long", year: "numeric", timeZone: "UTC" });
+    return this.buildPeriodSummary(`Monthly (${monthName})`, startDate, endDate, trades, liveEquity);
+  }
+
+  // ── Private: shared period aggregation ───────────────────
+
+  private buildPeriodSummary(
+    label: string,
+    periodStart: string,
+    periodEnd: string,
+    trades: ClosedTradeLedgerEntry[],
+    liveEquity?: number
+  ): PeriodSummary {
+    const wins       = trades.filter((t) => t.outcome === TradeOutcome.WIN);
+    const losses     = trades.filter((t) => t.outcome === TradeOutcome.LOSS);
+    const breakevens = trades.filter((t) => t.outcome === TradeOutcome.BREAKEVEN);
+
+    const winRatePct = wins.length + losses.length > 0
+      ? parseFloat(((wins.length / (wins.length + losses.length)) * 100).toFixed(1))
+      : 0;
+
+    const netPnLUSD = parseFloat(
+      trades.reduce((acc, t) => acc + t.realizedPnLUSD, 0).toFixed(4)
+    );
+    const totalR = parseFloat(
+      trades.reduce((acc, t) => acc + t.realizedPnLR, 0).toFixed(3)
+    );
+    const avgR = trades.length > 0
+      ? parseFloat((totalR / trades.length).toFixed(3))
+      : 0;
+
+    const grossProfit = parseFloat(
+      wins.reduce((acc, t) => acc + Math.max(0, t.realizedPnLUSD), 0).toFixed(4)
+    );
+    const grossLoss = parseFloat(
+      Math.abs(losses.reduce((acc, t) => acc + Math.min(0, t.realizedPnLUSD), 0)).toFixed(4)
+    );
+    const profitFactor = grossLoss > 0
+      ? parseFloat((grossProfit / grossLoss).toFixed(2))
+      : (grossProfit > 0 ? 999 : 0);
+
+    // Best and worst trades
+    let bestTrade: PeriodTradeSummary | null = null;
+    let worstTrade: PeriodTradeSummary | null = null;
+    if (trades.length > 0) {
+      const sorted = [...trades].sort((a, b) => b.realizedPnLUSD - a.realizedPnLUSD);
+      const best  = sorted[0];
+      const worst = sorted[sorted.length - 1];
+      bestTrade = {
+        pnlUSD: best.realizedPnLUSD,
+        pnlR: best.realizedPnLR,
+        strategy: best.strategyId,
+        direction: best.direction,
+        outcome: best.outcome,
+        durationMinutes: best.durationMinutes,
+      };
+      worstTrade = {
+        pnlUSD: worst.realizedPnLUSD,
+        pnlR: worst.realizedPnLR,
+        strategy: worst.strategyId,
+        direction: worst.direction,
+        outcome: worst.outcome,
+        durationMinutes: worst.durationMinutes,
+      };
+    }
+
+    // Intra-period max drawdown — walk through trades in time order
+    // tracking cumulative PnL high-water mark
+    let maxDrawdownPct = 0;
+    let runningPnL = 0;
+    let peakRunningPnL = 0;
+    const periodTradesChron = [...trades].sort((a, b) => a.closedAt - b.closedAt);
+    for (const t of periodTradesChron) {
+      runningPnL += t.realizedPnLUSD;
+      if (runningPnL > peakRunningPnL) peakRunningPnL = runningPnL;
+      const drawdown = peakRunningPnL > 0
+        ? ((peakRunningPnL - runningPnL) / Math.abs(peakRunningPnL)) * 100
+        : 0;
+      if (drawdown > maxDrawdownPct) maxDrawdownPct = drawdown;
+    }
+    maxDrawdownPct = parseFloat(maxDrawdownPct.toFixed(2));
+
+    // Equity anchors
+    const snap = this.getFinancialSnapshot();
+    const endingEquity = liveEquity && liveEquity > 0
+      ? liveEquity
+      : snap.totalEquityUSD;
+    const startingEquity = parseFloat(Math.max(0, endingEquity - netPnLUSD).toFixed(4));
+    const netPnLPct = startingEquity > 0
+      ? parseFloat(((netPnLUSD / startingEquity) * 100).toFixed(2))
+      : 0;
+
+    return {
+      label,
+      periodStart,
+      periodEnd,
+      totalTrades: trades.length,
+      wins: wins.length,
+      losses: losses.length,
+      breakevens: breakevens.length,
+      winRatePct,
+      netPnLUSD,
+      netPnLPct,
+      totalR,
+      avgR,
+      profitFactor,
+      bestTrade,
+      worstTrade,
+      maxDrawdownPct,
+      startingEquityUSD: startingEquity,
+      endingEquityUSD: endingEquity,
+    };
   }
 
   // ── Private helpers ────────────────────────────────────────

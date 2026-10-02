@@ -28,6 +28,8 @@ import {
   LiveBybitPosition,
   MarketFlow,
   MacroBias,
+  AggressionMode,
+  AdaptiveRiskDecision,
 } from "../types";
 import { BotLogger } from "../logger";
 import { TradeLedger } from "./ledger";
@@ -84,6 +86,15 @@ export class ExecutionEngine {
     reason: string,
     appliedThresholds: { minVol: number; minBW: number; minATR: number },
     isStrategyAware: boolean
+  ) => void) | null = null;
+  /**
+   * Fires whenever the autonomous risk governor evaluates an aggression tier.
+   * Dispatches full transparency telemetry to Telegram.
+   */
+  public onAdaptiveRiskDecision: ((
+    decision: AdaptiveRiskDecision,
+    signal: Signal,
+    allocatedMargin: number
   ) => void) | null = null;
 
   constructor(exchange: Exchange, config: BotConfig, logger: BotLogger) {
@@ -200,20 +211,32 @@ export class ExecutionEngine {
       return null;
     }
 
-    // ── 5. Fixed Position Sizing (Rule 1) ──────────────────────
-    // Decoupled from equity scaling and stop distance to prevent ballooning.
-    // Margin is fixed (e.g. $200, capped at $300 max) multiplied by 10x leverage.
-    const targetMargin = (this.config.fixedMarginPerTrade && this.config.fixedMarginPerTrade > 0)
-      ? this.config.fixedMarginPerTrade
-      : 200;
-    const maxMargin = (this.config.maxPositionMargin && this.config.maxPositionMargin > 0)
-      ? this.config.maxPositionMargin
-      : 300;
-    const effectiveMargin = Math.min(targetMargin, maxMargin, balance > 0 ? balance : targetMargin);
+    // ── 4.5 Autonomous Adaptive Aggression & Risk Governor ──
+    const riskDecision = this.evaluateAdaptiveRiskDecision(signal, balance);
+
+    if (!riskDecision.approved) {
+      this.logger.warn(`[Engine] Trade blocked by Risk Governor (${riskDecision.mode})`, {
+        strategy: signal.strategyId,
+        direction: signal.direction,
+        reason: riskDecision.reason,
+        accountState: riskDecision.accountState,
+      });
+
+      // Emit telemetry for Telegram transparency notification
+      this.onAdaptiveRiskDecision?.(riskDecision, signal, 0);
+      return null;
+    }
+
+    // ── 5. Dynamic Position Sizing (Adaptive Risk Tiers) ────
+    // Uses targetMarginUSD decided autonomously by the governor (Growth / Defense mode)
+    const effectiveMargin = Math.min(
+      riskDecision.targetMarginUSD,
+      this.config.maxPositionMargin || 300,
+      balance > 0 ? balance : riskDecision.targetMarginUSD
+    );
+
     const leverage = (this.config.leverage && this.config.leverage > 0) ? this.config.leverage : 10;
-    const maxNotional = maxMargin * leverage;
-    const targetNotional = effectiveMargin * leverage;
-    const safeNotional = Math.min(targetNotional, maxNotional);
+    const safeNotional = effectiveMargin * leverage;
     const rawSize = safeNotional / signal.entryPrice;
 
     if (rawSize <= 0 || !isFinite(rawSize)) {
@@ -226,14 +249,19 @@ export class ExecutionEngine {
       return null;
     }
 
-    this.logger.info("[Engine] Fixed Position Sized (Rule 1)", {
+    this.logger.info(`[Engine] Position Sized via ${riskDecision.mode} Mode`, {
+      mode: riskDecision.mode,
       marginUSD: effectiveMargin,
       leverage: `${leverage}x`,
       notionalUSD: safeNotional,
       rawSize,
       symbol: signal.symbol,
       entryPrice: signal.entryPrice,
+      reason: riskDecision.reason,
     });
+
+    // Notify risk decision telemetry
+    this.onAdaptiveRiskDecision?.(riskDecision, signal, effectiveMargin);
 
     // ── 6. CCXT precision normalization ────────────────────
     const { entry, sl, tp, size } = this.normalizePrecision(
@@ -285,6 +313,8 @@ export class ExecutionEngine {
       steppedStopTranchesFired: [],
       peakPrice: order.entryPrice,
       dynamicTrailingStop: undefined,
+      aggressionMode: riskDecision.mode,
+      modeRationale: riskDecision.reason,
     };
 
     this.state.openTrades.set(trade.id, trade);
@@ -1273,6 +1303,141 @@ export class ExecutionEngine {
     }
 
     return { passed: true, isStrategyAware, appliedThresholds };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Private: Autonomous Adaptive Aggression & Capital Defense Governor
+  //
+  // Evaluates real-time account performance (PnL, streaks, high-water mark):
+  //   - Mode A (Growth / Green Zone): In profit or win streak -> scale up sizing
+  //   - Mode B (Defense / Yellow Zone): Flat, chop, or minor pullback -> minimal baseline sizing
+  //   - Mode C (Profit-Lock / Red Zone): Profit target hit or consecutive losses -> halt entries & lock stack
+  // ──────────────────────────────────────────────────────────
+
+  private evaluateAdaptiveRiskDecision(signal: Signal, currentBalance: number): AdaptiveRiskDecision {
+    const fin = this.ledger.getFinancialSnapshot();
+    const closedTrades = this.state.closedTrades;
+
+    // 1. Calculate consecutive wins and losses from recent closed trades
+    let consecutiveWins = 0;
+    let consecutiveLosses = 0;
+
+    for (let i = closedTrades.length - 1; i >= 0; i--) {
+      const outcome = closedTrades[i].outcome;
+      if (outcome === TradeOutcome.WIN) {
+        if (consecutiveLosses === 0) consecutiveWins++;
+        else break;
+      } else if (outcome === TradeOutcome.LOSS) {
+        if (consecutiveWins === 0) consecutiveLosses++;
+        else break;
+      } else {
+        // BREAKEVEN or CANCELLED doesn't break streaks severely
+        continue;
+      }
+    }
+
+    // 2. Session / Current Day PnL & R-multiple
+    const sessionPnLUSD = closedTrades.reduce((acc, t) => acc + (t.pnlRaw ?? 0), 0);
+    const sessionPnLR = closedTrades.reduce((acc, t) => acc + (t.pnlR ?? 0), 0);
+
+    // 3. Peak equity & Drawdown from high-water mark
+    const peakEquity = fin.peakEquityUSD > 0 ? fin.peakEquityUSD : currentBalance;
+    const currentEquity = fin.totalEquityUSD > 0 ? fin.totalEquityUSD : currentBalance;
+    const drawdownUSD = Math.max(0, peakEquity - currentEquity);
+    const drawdownPct = peakEquity > 0 ? (drawdownUSD / peakEquity) * 100 : 0;
+
+    const accountState = {
+      sessionPnLUSD: parseFloat(sessionPnLUSD.toFixed(2)),
+      sessionPnLR: parseFloat(sessionPnLR.toFixed(2)),
+      peakEquityUSD: parseFloat(peakEquity.toFixed(2)),
+      currentEquityUSD: parseFloat(currentEquity.toFixed(2)),
+      drawdownFromPeakUSD: parseFloat(drawdownUSD.toFixed(2)),
+      drawdownFromPeakPct: parseFloat(drawdownPct.toFixed(2)),
+      consecutiveLosses,
+      consecutiveWins,
+    };
+
+    const baseMargin = this.config.fixedMarginPerTrade > 0 ? this.config.fixedMarginPerTrade : 200;
+    const maxMargin = this.config.maxPositionMargin > 0 ? this.config.maxPositionMargin : 300;
+    const minMargin = Math.max(50, Math.round(baseMargin * 0.5)); // 50% baseline for defense mode
+
+    // If adaptive aggression is disabled, fallback cleanly to standard fixed margin
+    if (!this.config.enableAdaptiveAggression) {
+      return {
+        mode: AggressionMode.GROWTH,
+        approved: true,
+        targetMarginUSD: baseMargin,
+        reason: "Adaptive aggression disabled — operating on standard fixed sizing.",
+        accountState,
+      };
+    }
+
+    // ── MODE C: PROFIT-LOCK & STAND DOWN (Red Zone) ─────────
+    // Trigger 1: Daily/Session Profit Target reached (e.g. >= $500 profit)
+    const profitTarget = this.config.sessionProfitTargetUSD ?? 500;
+    if (sessionPnLUSD >= profitTarget && sessionPnLUSD > 0) {
+      return {
+        mode: AggressionMode.PROFIT_LOCK,
+        approved: false,
+        targetMarginUSD: 0,
+        reason: `Session profit target ($${profitTarget}) achieved (+${sessionPnLUSD.toFixed(2)} USD). Locking in the stack and standing down to preserve gains.`,
+        accountState,
+      };
+    }
+
+    // Trigger 2: Consecutive loss circuit breaker hit (default: 2 consecutive losses)
+    const maxLosses = this.config.maxConsecutiveLossesStandDown ?? 2;
+    if (consecutiveLosses >= maxLosses) {
+      return {
+        mode: AggressionMode.PROFIT_LOCK,
+        approved: false,
+        targetMarginUSD: 0,
+        reason: `Consecutive loss limit reached (${consecutiveLosses}/${maxLosses} losses). Capital defense circuit breaker engaged — standing down until conditions reset.`,
+        accountState,
+      };
+    }
+
+    // Trigger 3: Severe pullback from peak equity (default: >= 5% from high-water mark)
+    const maxDDPct = this.config.maxDrawdownFromPeakStandDownPct ?? 5.0;
+    if (drawdownPct >= maxDDPct && peakEquity > currentBalance * 0.9) {
+      return {
+        mode: AggressionMode.PROFIT_LOCK,
+        approved: false,
+        targetMarginUSD: 0,
+        reason: `Drawdown from peak equity (${drawdownPct.toFixed(1)}% vs max ${maxDDPct}%) triggered capital defense. Halting entries to protect high-water mark.`,
+        accountState,
+      };
+    }
+
+    // ── MODE A: GROWTH / PROFIT-HUNTING (Green Zone) ─────────
+    // Trigger: Account in net profit OR winning streak, AND strategy score is high-confluence
+    const winningScore = signal.allScores?.find((s) => s.strategyId === signal.strategyId)?.score ?? 70;
+    const minGrowthScore = this.config.growthModeMinScore ?? 75;
+    const isProfitableOrHot = sessionPnLUSD > 0 || consecutiveWins >= 1;
+
+    if (isProfitableOrHot && winningScore >= minGrowthScore && consecutiveLosses === 0) {
+      // Dynamic scale-up: baseline margin scaled up based on winning streak & setup score
+      const streakBonus = Math.min(1.5, 1.0 + (consecutiveWins * 0.15) + ((winningScore - minGrowthScore) * 0.01));
+      const scaledMargin = Math.min(maxMargin, Math.round(baseMargin * streakBonus));
+
+      return {
+        mode: AggressionMode.GROWTH,
+        approved: true,
+        targetMarginUSD: scaledMargin,
+        reason: `Growth Mode active: Account in profit (+${sessionPnLUSD.toFixed(2)} USD, ${consecutiveWins}W streak) with high-confluence setup (${winningScore}/100 score). Scaling margin to $${scaledMargin} to compound gains.`,
+        accountState,
+      };
+    }
+
+    // ── MODE B: CONSOLIDATION / DEFENSE (Yellow Zone) ────────
+    // Trigger: Flat session, recovering from minor loss, or standard setup score
+    return {
+      mode: AggressionMode.DEFENSE,
+      approved: true,
+      targetMarginUSD: minMargin,
+      reason: `Defense Mode active: Market is consolidating or recovering (Session PnL: ${sessionPnLUSD >= 0 ? "+" : ""}${sessionPnLUSD.toFixed(2)} USD). Sizing dialed back to minimal capital-preservation margin ($${minMargin}).`,
+      accountState,
+    };
   }
 
   // ──────────────────────────────────────────────────────────

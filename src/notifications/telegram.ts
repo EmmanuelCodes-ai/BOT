@@ -333,4 +333,151 @@ export class TelegramNotifier {
 
     sendMessage(this.token, this.chatId, msg);
   }
+
+  /**
+   * Renders a weekly or monthly performance report as a richly formatted
+   * Telegram HTML message. Works for both scheduled auto-reports and
+   * on-demand /weekly and /monthly slash commands.
+   */
+  notifyPeriodSummary(params: {
+    label: string;
+    periodStart: string;
+    periodEnd: string;
+    totalTrades: number;
+    wins: number;
+    losses: number;
+    breakevens: number;
+    winRatePct: number;
+    netPnLUSD: number;
+    netPnLPct: number;
+    totalR: number;
+    avgR: number;
+    profitFactor: number;
+    bestTrade: { pnlUSD: number; pnlR: number; strategy: string; direction: string; durationMinutes: number } | null;
+    worstTrade: { pnlUSD: number; pnlR: number; strategy: string; direction: string; durationMinutes: number } | null;
+    maxDrawdownPct: number;
+    startingEquityUSD: number;
+    endingEquityUSD: number;
+  }): void {
+    if (!this.enabled) return;
+
+    const isWeekly = params.label.toLowerCase().includes("week");
+    const headerEmoji = isWeekly ? "📅" : "🗓️";
+    const pnlPositive = params.netPnLUSD >= 0;
+    const pnlEmoji = pnlPositive ? "📈" : "📉";
+    const pnlSign = pnlPositive ? "+" : "";
+    const pnlPctSign = params.netPnLPct >= 0 ? "+" : "";
+    const equityChange = params.endingEquityUSD - params.startingEquityUSD;
+    const equitySign = equityChange >= 0 ? "+" : "";
+
+    // Win rate, profit factor, and drawdown tier badges
+    const wrEmoji = params.winRatePct >= 60 ? "🔥" : params.winRatePct >= 45 ? "✅" : "⚠️";
+    const pfEmoji = params.profitFactor >= 1.5 ? "🏆" : params.profitFactor >= 1.0 ? "✅" : "❌";
+    const ddEmoji = params.maxDrawdownPct <= 2 ? "🛡️" : params.maxDrawdownPct <= 5 ? "⚠️" : "🔴";
+
+    const summaryTitle = isWeekly
+      ? `${headerEmoji} <b>WEEKLY PERFORMANCE REPORT</b>`
+      : `${headerEmoji} <b>MONTHLY PERFORMANCE REPORT</b>`;
+
+    let bestTradeStr = "No trades closed this period.";
+    let worstTradeStr = "No trades closed this period.";
+    if (params.bestTrade) {
+      const bSign = params.bestTrade.pnlUSD >= 0 ? "+" : "";
+      bestTradeStr = `${bSign}$${params.bestTrade.pnlUSD.toFixed(2)} (${bSign}${params.bestTrade.pnlR.toFixed(2)}R) · ${params.bestTrade.strategy} ${params.bestTrade.direction} · ${params.bestTrade.durationMinutes}m`;
+    }
+    if (params.worstTrade) {
+      const wSign = params.worstTrade.pnlUSD >= 0 ? "+" : "";
+      worstTradeStr = `${wSign}$${params.worstTrade.pnlUSD.toFixed(2)} (${wSign}${params.worstTrade.pnlR.toFixed(2)}R) · ${params.worstTrade.strategy} ${params.worstTrade.direction} · ${params.worstTrade.durationMinutes}m`;
+    }
+
+    const tradesLine = params.totalTrades > 0
+      ? `${params.totalTrades} trades  (✅ ${params.wins}W · ❌ ${params.losses}L · 🛡️ ${params.breakevens}BE)`
+      : "0 trades taken this period.";
+
+    const msg =
+      `${summaryTitle}\n` +
+      `<i>${params.periodStart} → ${params.periodEnd}</i>\n\n` +
+      `${pnlEmoji} <b>Net PnL</b>: <b>${pnlSign}$${params.netPnLUSD.toFixed(2)}</b>  (${pnlPctSign}${params.netPnLPct.toFixed(2)}%)\n` +
+      `📊 <b>R-Performance</b>: ${params.totalR >= 0 ? "+" : ""}${params.totalR.toFixed(2)}R total · ${params.avgR >= 0 ? "+" : ""}${params.avgR.toFixed(2)}R avg/trade\n\n` +
+      `💰 <b>Account</b>\n` +
+      `• Start Equity   : $${params.startingEquityUSD.toFixed(2)}\n` +
+      `• End Equity     : $${params.endingEquityUSD.toFixed(2)}\n` +
+      `• Change         : ${equitySign}$${equityChange.toFixed(2)}\n\n` +
+      `📋 <b>Trade Record</b>\n` +
+      `• ${tradesLine}\n` +
+      `• ${wrEmoji} Win Rate       : ${params.winRatePct.toFixed(1)}%\n` +
+      `• ${pfEmoji} Profit Factor  : ${params.profitFactor === 999 ? "∞" : params.profitFactor.toFixed(2)}\n\n` +
+      `🏅 <b>Best Trade</b>\n` +
+      `<code>${bestTradeStr}</code>\n\n` +
+      `💀 <b>Worst Trade</b>\n` +
+      `<code>${worstTradeStr}</code>\n\n` +
+      `${ddEmoji} <b>Max Intra-Period Drawdown</b>: ${params.maxDrawdownPct.toFixed(2)}%`;
+
+    sendMessage(this.token, this.chatId, msg);
+  }
+
+  /**
+   * Sent whenever the autonomous risk governor evaluates an aggression tier.
+   * Reports Account State, Selected Mode, Sizing Rationale, and Technical Confluence.
+   */
+  notifyAdaptiveRiskDecision(params: {
+    mode: "GROWTH" | "DEFENSE" | "PROFIT_LOCK";
+    approved: boolean;
+    allocatedMarginUSD: number;
+    reason: string;
+    strategy: string;
+    direction: string;
+    symbol: string;
+    score: number;
+    flow: string;
+    macroBias: string;
+    rsi: number;
+    sessionPnLUSD: number;
+    sessionPnLR: number;
+    peakEquityUSD: number;
+    drawdownPct: number;
+    consecutiveWins: number;
+    consecutiveLosses: number;
+  }): void {
+    if (!this.enabled) return;
+
+    let modeEmoji = "🛡️";
+    let modeBadge = "MODE B: CONSOLIDATION / DEFENSE (Yellow Zone)";
+
+    if (params.mode === "GROWTH") {
+      modeEmoji = "🚀";
+      modeBadge = "MODE A: GROWTH / PROFIT-HUNTING (Green Zone)";
+    } else if (params.mode === "PROFIT_LOCK") {
+      modeEmoji = "🔒";
+      modeBadge = "MODE C: PROFIT-LOCK & STAND DOWN (Red Zone)";
+    }
+
+    const pnlSign = params.sessionPnLUSD >= 0 ? "+" : "";
+    const streakStr = params.consecutiveWins > 0
+      ? `${params.consecutiveWins} consecutive wins 🔥`
+      : (params.consecutiveLosses > 0 ? `${params.consecutiveLosses} consecutive losses ⚠️` : "Neutral");
+
+    const statusBadge = params.approved ? "✅ <b>TRADE APPROVED & SIZED</b>" : "⛔ <b>TRADE BLOCKED (CAPITAL DEFENSE)</b>";
+
+    const msg =
+      `${modeEmoji} <b>AUTONOMOUS TRADE COMMANDER</b>\n` +
+      `<b>${modeBadge}</b>\n\n` +
+      `${statusBadge}\n` +
+      `Strategy     : ${params.strategy} (${params.direction})\n` +
+      `Symbol       : ${params.symbol}\n` +
+      `Allocated    : $${params.allocatedMarginUSD.toFixed(2)} Margin\n\n` +
+      `📊 <b>Account & Profit State:</b>\n` +
+      `• Session PnL: ${pnlSign}$${params.sessionPnLUSD.toFixed(2)} (${pnlSign}${params.sessionPnLR.toFixed(2)}R)\n` +
+      `• Peak Equity: $${params.peakEquityUSD.toFixed(2)} (DD: ${params.drawdownPct.toFixed(1)}%)\n` +
+      `• Streak     : ${streakStr}\n\n` +
+      `💡 <b>Sizing & Mode Rationale:</b>\n` +
+      `<i>${params.reason}</i>\n\n` +
+      `🎯 <b>Technical Confluence:</b>\n` +
+      `• Strategy Score: ${params.score}/100\n` +
+      `• Market Flow   : ${params.flow} | Macro: ${params.macroBias}\n` +
+      `• RSI(14)       : ${params.rsi.toFixed(1)}`;
+
+    sendMessage(this.token, this.chatId, msg);
+  }
 }
+
