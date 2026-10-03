@@ -231,7 +231,7 @@ export class ExecutionEngine {
     // Uses targetMarginUSD decided autonomously by the governor (Growth / Defense mode)
     const effectiveMargin = Math.min(
       riskDecision.targetMarginUSD,
-      this.config.maxPositionMargin || 300,
+      this.config.maxPositionMargin || 1500,
       balance > 0 ? balance : riskDecision.targetMarginUSD
     );
 
@@ -1357,8 +1357,8 @@ export class ExecutionEngine {
       consecutiveWins,
     };
 
-    const baseMargin = this.config.fixedMarginPerTrade > 0 ? this.config.fixedMarginPerTrade : 200;
-    const maxMargin = this.config.maxPositionMargin > 0 ? this.config.maxPositionMargin : 300;
+    const baseMargin = this.config.fixedMarginPerTrade > 0 ? this.config.fixedMarginPerTrade : 1000;
+    const maxMargin = this.config.maxPositionMargin > 0 ? this.config.maxPositionMargin : 1500;
     const minMargin = Math.max(50, Math.round(baseMargin * 0.5)); // 50% baseline for defense mode
 
     // If adaptive aggression is disabled, fallback cleanly to standard fixed margin

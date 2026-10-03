@@ -84,6 +84,8 @@ export class TelegramNotifier {
     }
     ids += `Full UUID : <code>${rawId || "—"}</code>`;
 
+    const notionalUSD = (params.size * params.entry).toFixed(2);
+
     const msg =
       `${header}\n\n` +
       `Strategy  : ${params.strategy}\n` +
@@ -92,7 +94,7 @@ export class TelegramNotifier {
       `Entry     : ${params.entry} (Bybit API Fill)\n` +
       `Stop Loss : ${params.stopLoss}\n` +
       `Take Profit: ${params.takeProfit}\n` +
-      `Size      : ${params.size}\n` +
+      `Size      : ${params.size} (~$${notionalUSD} Notional)\n` +
       `Flow      : ${params.flow}\n` +
       `Score     : ${params.score}\n\n` +
       ids + `\n` +

@@ -90,13 +90,13 @@ function loadConfig(): BotConfig {
     minBollingerBandwidth: parseFloat(process.env.MIN_BOLLINGER_BANDWIDTH ?? "0.0025"),
     minATRExpansionRatio: parseFloat(process.env.MIN_ATR_EXPANSION_RATIO ?? "0.85"),
     // ── Fixed Position Sizing (Rule 1) ─────────────────────────
-    // Decoupled from equity. Every trade uses fixedMarginPerTrade × leverage.
+    // Decoupled from equity. Every trade uses fixedMarginPerTrade × leverage ($1,000 margin = $10,000 notional at 10x).
     fixedMarginPerTrade: (() => {
-      const maxMargin = parseFloat(process.env.MAX_POSITION_MARGIN ?? "300");
-      const raw = parseFloat(process.env.FIXED_MARGIN_PER_TRADE ?? "200");
+      const maxMargin = parseFloat(process.env.MAX_POSITION_MARGIN ?? "1500");
+      const raw = parseFloat(process.env.FIXED_MARGIN_PER_TRADE ?? "1000");
       return Math.max(50, Math.min(raw, maxMargin)); // Clamp: $50 minimum, maxMargin maximum
     })(),
-    maxPositionMargin: parseFloat(process.env.MAX_POSITION_MARGIN ?? "300"),
+    maxPositionMargin: parseFloat(process.env.MAX_POSITION_MARGIN ?? "1500"),
     // ── Limit Orders Only (Rule 2) ─────────────────────────────
     // true = PostOnly Maker entries/exits (falls back to GTC if book-crossing)
     limitOrderPostOnly: process.env.LIMIT_ORDER_POST_ONLY !== "false",
@@ -112,7 +112,7 @@ function loadConfig(): BotConfig {
     trailingStopDistancePct: parseFloat(process.env.TRAILING_STOP_DISTANCE_PCT ?? "0.3"),
     // ── Autonomous Adaptive Aggression & Profit-Hunting ────────
     enableAdaptiveAggression: process.env.ENABLE_ADAPTIVE_AGGRESSION !== "false",
-    sessionProfitTargetUSD: parseFloat(process.env.SESSION_PROFIT_TARGET_USD ?? "500"),
+    sessionProfitTargetUSD: parseFloat(process.env.SESSION_PROFIT_TARGET_USD ?? "2500"),
     maxConsecutiveLossesStandDown: parseInt(process.env.MAX_CONSECUTIVE_LOSSES_STAND_DOWN ?? "2", 10),
     maxDrawdownFromPeakStandDownPct: parseFloat(process.env.MAX_DRAWDOWN_FROM_PEAK_STAND_DOWN_PCT ?? "5.0"),
     growthModeMinScore: parseFloat(process.env.GROWTH_MODE_MIN_SCORE ?? "75"),
